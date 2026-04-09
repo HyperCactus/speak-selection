@@ -1999,7 +1999,7 @@ def tray_main():
 
     try:
         import pystray
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageDraw, ImageFont
     except Exception as e:
         raise SystemExit(
             "Tray mode requires extra packages.\n"
@@ -2012,11 +2012,41 @@ def tray_main():
         thread.start()
 
     def make_icon_image():
-        image = Image.new("RGB", (64, 64), (30, 35, 40))
+        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        draw.ellipse((10, 10, 54, 54), fill=(52, 152, 219))
-        draw.rectangle((30, 20, 46, 44), fill=(245, 245, 245))
-        draw.rectangle((18, 25, 30, 39), fill=(245, 245, 245))
+        draw.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(20, 24, 32, 255))
+
+        font_candidates = []
+        if sys.platform == "linux":
+            font_candidates.extend(
+                [
+                    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+                    "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+                ]
+            )
+        elif sys.platform == "darwin":
+            font_candidates.extend(
+                [
+                    "/System/Library/Fonts/Apple Color Emoji.ttc",
+                    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                ]
+            )
+
+        for font_path in font_candidates:
+            try:
+                font = ImageFont.truetype(font_path, 44)
+                draw.text((32, 31), "🗣️", font=font, anchor="mm", embedded_color=True)
+                return image
+            except Exception:
+                continue
+
+        # Fallback if emoji fonts are unavailable.
+        draw.ellipse((10, 10, 54, 54), fill=(39, 174, 96, 255))
+        draw.polygon([(24, 26), (33, 20), (33, 42), (24, 36)], fill=(245, 245, 245, 255))
+        draw.rectangle((20, 27, 25, 35), fill=(245, 245, 245, 255))
+        draw.arc((33, 22, 49, 40), start=300, end=60, fill=(245, 245, 245, 255), width=3)
+        draw.arc((35, 18, 55, 44), start=300, end=60, fill=(245, 245, 245, 200), width=2)
         return image
 
     def action_speak(icon, item):
