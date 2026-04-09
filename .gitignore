@@ -230,3 +230,9 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+
+# ----
+.agents
+.kilocode
+skills-lock.json
