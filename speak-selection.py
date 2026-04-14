@@ -113,6 +113,10 @@ WAV_COMPRESS_RATIO = max(
 )
 RESET_STREAM_VOLUME = env_bool("SPEAK_SELECTION_RESET_STREAM_VOLUME", True)
 STREAM_VOLUME_PERCENT = max(1, min(200, env_int("SPEAK_SELECTION_STREAM_VOLUME", 100)))
+STREAM_VOLUME_ENFORCE_INTERVAL = max(
+    0.1,
+    min(5.0, env_float("SPEAK_SELECTION_STREAM_VOLUME_ENFORCE_INTERVAL", 0.75)),
+)
 SELECTION_READ_TIMEOUT = max(0.1, min(2.0, env_float("SPEAK_SELECTION_SELECTION_TIMEOUT", 0.8)))
 SELECTION_READ_RETRIES = max(1, min(20, env_int("SPEAK_SELECTION_SELECTION_RETRIES", 6)))
 SELECTION_RETRY_DELAY = max(0.01, min(0.5, env_float("SPEAK_SELECTION_SELECTION_RETRY_DELAY", 0.04)))
@@ -154,6 +158,7 @@ DEFAULT_VOICE_DOWNLOADS = {
 # - SPEAK_SELECTION_WAV_COMPRESS_RATIO: compressor ratio (>1.0, example: 3.0)
 # - SPEAK_SELECTION_RESET_STREAM_VOLUME: 1|true|yes to reset Linux stream volume for mpv
 # - SPEAK_SELECTION_STREAM_VOLUME: Linux stream volume target percent (example: 100)
+# - SPEAK_SELECTION_STREAM_VOLUME_ENFORCE_INTERVAL: seconds between Linux stream volume re-apply attempts
 # - SPEAK_SELECTION_SELECTION_TIMEOUT: selection command timeout in seconds
 # - SPEAK_SELECTION_SELECTION_RETRIES: retry count for selection capture
 # - SPEAK_SELECTION_SELECTION_RETRY_DELAY: delay between selection retries
@@ -483,7 +488,11 @@ def diagnose_audio(text: str):
                 pass
 
 
-def maybe_reset_linux_stream_volume(mpv_pid: int):
+STREAM_VOLUME_KEEPER_LOCK = threading.Lock()
+STREAM_VOLUME_KEEPER_PIDS = set()
+
+
+def maybe_reset_linux_stream_volume(mpv_pid: int, keep_enforcing: bool = False):
     if sys.platform != "linux":
         return
     if not RESET_STREAM_VOLUME:
@@ -496,16 +505,23 @@ def maybe_reset_linux_stream_volume(mpv_pid: int):
 
     target_volume = f"{STREAM_VOLUME_PERCENT}%"
 
+    with STREAM_VOLUME_KEEPER_LOCK:
+        if mpv_pid in STREAM_VOLUME_KEEPER_PIDS:
+            return
+        STREAM_VOLUME_KEEPER_PIDS.add(mpv_pid)
+
     def try_wpctl() -> bool:
         if not wpctl:
             return False
         try:
-            subprocess.run(
+            quick_set = subprocess.run(
                 [wpctl, "set-volume", "--pid", str(mpv_pid), target_volume],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+            if quick_set.returncode == 0:
+                return True
 
             status_proc = subprocess.run(
                 [wpctl, "status"],
@@ -613,12 +629,22 @@ def maybe_reset_linux_stream_volume(mpv_pid: int):
         return False
 
     def worker():
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if try_wpctl() or try_pactl():
-                return
+        deadline = (time.time() + 5.0) if not keep_enforcing else None
+        try:
+            while _pid_exists(mpv_pid):
+                if deadline is not None and time.time() >= deadline:
+                    break
 
-            time.sleep(0.05)
+                if not try_wpctl():
+                    try_pactl()
+
+                if keep_enforcing:
+                    time.sleep(STREAM_VOLUME_ENFORCE_INTERVAL)
+                else:
+                    time.sleep(0.05)
+        finally:
+            with STREAM_VOLUME_KEEPER_LOCK:
+                STREAM_VOLUME_KEEPER_PIDS.discard(mpv_pid)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -2251,7 +2277,7 @@ class Daemon:
             start_new_session=True,
             close_fds=True,
         )
-        maybe_reset_linux_stream_volume(self.mpv_proc.pid)
+        maybe_reset_linux_stream_volume(self.mpv_proc.pid, keep_enforcing=True)
 
         deadline = time.time() + 2.0
         while time.time() < deadline:
