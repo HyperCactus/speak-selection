@@ -22,6 +22,7 @@ from array import array
 from pathlib import Path
 from typing import Optional
 
+
 def env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None:
@@ -64,21 +65,22 @@ def get_default_state_dir() -> Path:
     return Path.home() / ".cache" / "speak-selection"
 
 
-def get_default_voice_dir() -> Path:
+def get_default_voice_style_dirs() -> list[Path]:
     voice_dir_override = os.environ.get("SPEAK_SELECTION_VOICE_DIR", "").strip()
+    dirs: list[Path] = []
     if voice_dir_override:
-        return Path(voice_dir_override).expanduser()
+        dirs.append(Path(voice_dir_override).expanduser())
 
     if sys.platform == "win32":
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        if local_appdata:
-            return Path(local_appdata) / "piper" / "voices"
-        return Path.home() / "AppData" / "Local" / "piper" / "voices"
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path.home() / ".cache"
 
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "piper" / "voices"
-
-    return Path.home() / ".local" / "share" / "piper" / "voices"
+    dirs.append(base / "supertonic3" / "voice_styles")
+    dirs.append(base / "supertonic3" / "custom_styles")
+    return dirs
 
 
 DEFAULT_STATE_DIR = get_default_state_dir()
@@ -88,14 +90,12 @@ DAEMON_PID_PATH = STATE_DIR / "daemon.pid"
 TRAY_PID_PATH = STATE_DIR / "tray.pid"
 SETTINGS_UI_PID_PATH = STATE_DIR / "settings-ui.pid"
 MPV_SOCKET_PATH = STATE_DIR / "mpv.sock"
-VOICE_DIR = get_default_voice_dir()
+VOICE_STYLE_DIRS = get_default_voice_style_dirs()
 CACHE_DIR = STATE_DIR / "audio-cache"
 SETTINGS_PATH = STATE_DIR / "settings.json"
-VOICE_CATALOG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json"
-VOICE_SAMPLES_URL = "https://rhasspy.github.io/piper-samples/"
+VOICE_SAMPLES_URL = "https://supertonic3.github.io/"
 
 # Tuning
-PIPER_LENGTH_SCALE = env_float("SPEAK_SELECTION_LENGTH_SCALE", 0.95)
 PLAYBACK_SPEED = max(0.25, min(4.0, env_float("SPEAK_SELECTION_PLAYBACK_SPEED", 1.85)))
 PLAYBACK_VOLUME = max(0.0, min(200.0, env_float("SPEAK_SELECTION_VOLUME", 100.0)))
 MPV_VOLUME_MAX = 200
@@ -122,32 +122,45 @@ SELECTION_READ_RETRIES = max(1, min(20, env_int("SPEAK_SELECTION_SELECTION_RETRI
 SELECTION_RETRY_DELAY = max(0.01, min(0.5, env_float("SPEAK_SELECTION_SELECTION_RETRY_DELAY", 0.04)))
 ALLOW_CLIPBOARD_FALLBACK = env_bool("SPEAK_SELECTION_ALLOW_CLIPBOARD_FALLBACK", False)
 EMPTY_SELECTION_TOGGLES = env_bool("SPEAK_SELECTION_EMPTY_TOGGLES", False)
-SENTENCE_SILENCE = 0.10
-NOISE_SCALE = env_float("SPEAK_SELECTION_NOISE_SCALE", 0.667)
-NOISE_W = env_float("SPEAK_SELECTION_NOISE_W", 0.8)
 ARTICLE_MAX_CHARS = max(1000, env_int("SPEAK_SELECTION_ARTICLE_MAX_CHARS", 30000))
 CACHE_ENABLED = env_bool("SPEAK_SELECTION_CACHE_ENABLED", True)
 CACHE_MAX_FILES = max(20, env_int("SPEAK_SELECTION_CACHE_MAX_FILES", 800))
 AUTO_LANGUAGE_ROUTING = env_bool("SPEAK_SELECTION_AUTO_LANGUAGE", True)
 AUTO_TRAY_ENABLED = env_bool("SPEAK_SELECTION_AUTO_TRAY", True)
 
-VOICE_MODELS = {
-    "medium": VOICE_DIR / "en_US-lessac-medium.onnx",
-    "high": VOICE_DIR / "en_US-lessac-high.onnx",
-}
-DEFAULT_VOICE_ORDER = ("medium", "high")
+BUILTIN_VOICES = ["M1", "M2", "M3", "M4", "M5", "F1", "F2", "F3", "F4", "F5"]
+DEFAULT_VOICE_NAME = "M1"
 
-DEFAULT_VOICE_DOWNLOADS = {
-    "medium": {
-        "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
-        "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
-    },
-}
+def derive_tts_speed() -> float:
+    env_speed = os.environ.get("SPEAK_SELECTION_TTS_SPEED")
+    if env_speed:
+        try:
+            return float(env_speed)
+        except ValueError:
+            pass
+
+    legacy_scale = os.environ.get("SPEAK_SELECTION_LENGTH_SCALE")
+    if legacy_scale:
+        try:
+            scale = float(legacy_scale)
+            if scale > 0:
+                return 1.0 / scale
+        except ValueError:
+            pass
+
+    return 1.05
+
+
+TTS_SPEED = max(0.7, min(2.0, derive_tts_speed()))
+TTS_STEPS = max(5, min(12, env_int("SPEAK_SELECTION_TTS_STEPS", 5)))
+TTS_MAX_CHUNK = max(80, min(600, env_int("SPEAK_SELECTION_TTS_MAX_CHUNK", 220)))
+TTS_SILENCE_DURATION = max(0.0, min(2.0, env_float("SPEAK_SELECTION_TTS_SILENCE", 0.0)))
+TTS_FIRST_CHUNK = max(0, min(300, env_int("SPEAK_SELECTION_TTS_FIRST_CHUNK", 120)))
+INITIAL_BUFFER_SEGMENTS = max(1, min(4, env_int("SPEAK_SELECTION_INITIAL_BUFFER", 1)))
 
 # Environment options:
-# - SPEAK_SELECTION_VOICE: auto | medium | high | /path/to/voice.onnx
-# - SPEAK_SELECTION_LOW_MEMORY_ORT: 1|true|yes to disable ONNX CPU memory arena
-# - SPEAK_SELECTION_VOICE_DIR: override directory containing .onnx/.json voices
+# - SPEAK_SELECTION_VOICE: auto | M1..M5 | F1..F5 | /path/to/voice.json
+# - SPEAK_SELECTION_VOICE_DIR: optional folder containing voice JSON files
 # - SPEAK_SELECTION_PLAYBACK_SPEED: mpv playback speed 0.25-4.0 (example: 1.5)
 # - SPEAK_SELECTION_VOLUME: mpv volume percentage 0-200 (example: 100)
 # - SPEAK_SELECTION_WAV_POST_BOOST: 1|true|yes to boost generated WAV safely
@@ -165,9 +178,12 @@ DEFAULT_VOICE_DOWNLOADS = {
 # - SPEAK_SELECTION_ALLOW_CLIPBOARD_FALLBACK: Linux fallback to clipboard if primary is empty
 # - SPEAK_SELECTION_EMPTY_TOGGLES: empty selection toggles pause/resume (default off)
 # - SPEAK_SELECTION_AUTO_TRAY: auto-start tray mode on Linux/macOS when script is invoked
-# - SPEAK_SELECTION_LENGTH_SCALE: Piper speaking pace (lower=faster, example: 0.9)
-# - SPEAK_SELECTION_NOISE_SCALE: Piper variation (example: 0.667)
-# - SPEAK_SELECTION_NOISE_W: Piper phoneme width variation (example: 0.8)
+# - SPEAK_SELECTION_TTS_SPEED: Supertonic speed 0.7-2.0 (example: 1.05)
+# - SPEAK_SELECTION_TTS_STEPS: Supertonic quality 5-12 (example: 8)
+# - SPEAK_SELECTION_TTS_MAX_CHUNK: Supertonic chunk size in chars (example: 300)
+# - SPEAK_SELECTION_TTS_SILENCE: silence between Supertonic chunks (seconds)
+# - SPEAK_SELECTION_TTS_FIRST_CHUNK: first chunk size for faster start (0 disables)
+# - SPEAK_SELECTION_INITIAL_BUFFER: number of chunks to buffer before playback
 # - SPEAK_SELECTION_AUTO_LANGUAGE: 1|true|yes to route text to matching language voices
 # - SPEAK_SELECTION_CACHE_ENABLED: 1|true|yes to cache synthesized audio
 # - SPEAK_SELECTION_CACHE_MAX_FILES: max number of cached wav files
@@ -175,6 +191,7 @@ DEFAULT_VOICE_DOWNLOADS = {
 
 DEFAULT_TEST_TEXT = "This is a hardcoded test of the speak selection script."
 SEGMENT_MAX_CHARS = 220
+
 
 def ensure_state_dir():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -262,7 +279,10 @@ def apply_post_gain_to_wav(path: str):
 
 def current_audio_settings() -> dict:
     return {
-        "length_scale": PIPER_LENGTH_SCALE,
+        "tts_speed": TTS_SPEED,
+        "tts_steps": TTS_STEPS,
+        "tts_max_chunk": TTS_MAX_CHUNK,
+        "tts_silence": TTS_SILENCE_DURATION,
         "playback_speed": PLAYBACK_SPEED,
         "playback_volume": PLAYBACK_VOLUME,
         "wav_post_boost": WAV_POST_BOOST_ENABLED,
@@ -285,13 +305,23 @@ def apply_audio_settings(settings: dict):
         except (TypeError, ValueError):
             return default
 
+    def _to_int(name: str, default: int) -> int:
+        value = settings.get(name, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     def _to_bool(name: str, default: bool) -> bool:
         value = settings.get(name, default)
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-    global PIPER_LENGTH_SCALE
+    global TTS_SPEED
+    global TTS_STEPS
+    global TTS_MAX_CHUNK
+    global TTS_SILENCE_DURATION
     global PLAYBACK_SPEED
     global PLAYBACK_VOLUME
     global WAV_POST_BOOST_ENABLED
@@ -301,7 +331,10 @@ def apply_audio_settings(settings: dict):
     global WAV_COMPRESS_THRESHOLD
     global WAV_COMPRESS_RATIO
 
-    PIPER_LENGTH_SCALE = clamp_float(_to_float("length_scale", PIPER_LENGTH_SCALE), 0.5, 2.0)
+    TTS_SPEED = clamp_float(_to_float("tts_speed", TTS_SPEED), 0.7, 2.0)
+    TTS_STEPS = max(5, min(12, _to_int("tts_steps", TTS_STEPS)))
+    TTS_MAX_CHUNK = max(80, min(600, _to_int("tts_max_chunk", TTS_MAX_CHUNK)))
+    TTS_SILENCE_DURATION = clamp_float(_to_float("tts_silence", TTS_SILENCE_DURATION), 0.0, 2.0)
     PLAYBACK_SPEED = clamp_float(_to_float("playback_speed", PLAYBACK_SPEED), 0.25, 4.0)
     PLAYBACK_VOLUME = clamp_float(_to_float("playback_volume", PLAYBACK_VOLUME), 0.0, 200.0)
     WAV_POST_BOOST_ENABLED = _to_bool("wav_post_boost", WAV_POST_BOOST_ENABLED)
@@ -359,26 +392,23 @@ def bootstrap_runtime_settings():
     if not isinstance(audio_settings, dict):
         return
 
-    env_map = {
-        "length_scale": "SPEAK_SELECTION_LENGTH_SCALE",
-        "playback_speed": "SPEAK_SELECTION_PLAYBACK_SPEED",
-        "playback_volume": "SPEAK_SELECTION_VOLUME",
-        "wav_post_boost": "SPEAK_SELECTION_WAV_POST_BOOST",
-        "wav_post_gain": "SPEAK_SELECTION_WAV_POST_GAIN",
-        "wav_post_peak": "SPEAK_SELECTION_WAV_POST_PEAK",
-        "wav_compress": "SPEAK_SELECTION_WAV_COMPRESS",
-        "wav_compress_threshold": "SPEAK_SELECTION_WAV_COMPRESS_THRESHOLD",
-        "wav_compress_ratio": "SPEAK_SELECTION_WAV_COMPRESS_RATIO",
-    }
-
     filtered_settings = {}
     for key, value in audio_settings.items():
-        env_name = env_map.get(key)
-        if not env_name:
-            continue
-        if os.environ.get(env_name) is not None:
-            continue
-        filtered_settings[key] = value
+        if key in {
+            "tts_speed",
+            "tts_steps",
+            "tts_max_chunk",
+            "tts_silence",
+            "playback_speed",
+            "playback_volume",
+            "wav_post_boost",
+            "wav_post_gain",
+            "wav_post_peak",
+            "wav_compress",
+            "wav_compress_threshold",
+            "wav_compress_ratio",
+        }:
+            filtered_settings[key] = value
 
     apply_audio_settings(filtered_settings)
 
@@ -387,7 +417,7 @@ USER_SETTINGS = load_user_settings()
 bootstrap_runtime_settings()
 
 
-def compute_request_hash(text: str, voice_preference: str = "", audio_settings: Optional[dict] = None) -> str:
+def compute_request_hash(text: str, voice_preference: str = "", audio_settings: Optional[dict] = None, lang: str = "") -> str:
     if audio_settings is None:
         audio_settings = current_audio_settings()
 
@@ -395,6 +425,7 @@ def compute_request_hash(text: str, voice_preference: str = "", audio_settings: 
         "text": normalize_text(text),
         "voice": (voice_preference or "").strip(),
         "audio": audio_settings,
+        "lang": (lang or "").strip(),
     }
     fingerprint = json.dumps(
         fingerprint_obj,
@@ -450,8 +481,8 @@ def diagnose_audio(text: str):
 
     ensure_state_dir()
     daemon = Daemon()
-    voice_path = choose_voice_path_for_text(text)
-    voice = daemon.load_voice(voice_path)
+    lang = resolve_language(text)
+    voice_style, voice_label = daemon.resolve_voice_style(get_voice_preference())
 
     raw_fd, raw_path = tempfile.mkstemp(prefix="speak-selection-diag-raw-", suffix=".wav", dir=str(STATE_DIR))
     os.close(raw_fd)
@@ -461,8 +492,8 @@ def diagnose_audio(text: str):
         daemon.synthesize_text_to_file(
             text,
             raw_path,
-            voice,
-            syn_config=daemon.get_synthesis_config(),
+            voice_style,
+            lang=lang,
             segment_text=True,
         )
         raw_stats = analyze_wav_levels(raw_path)
@@ -473,7 +504,8 @@ def diagnose_audio(text: str):
 
         payload = {
             "audio_settings": current_audio_settings(),
-            "voice_path": str(voice_path),
+            "voice": voice_label,
+            "lang": lang,
             "raw": raw_stats,
             "boosted": boosted_stats,
         }
@@ -653,339 +685,9 @@ def looks_like_url(text: str) -> bool:
     return bool(re.match(r"^https?://", text.strip(), re.IGNORECASE))
 
 
-def download_file(url: str, destination: Path):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = destination.with_suffix(destination.suffix + ".download")
-    req = urllib.request.Request(url, headers={"User-Agent": "speak-selection/1.0"})
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response, tmp_path.open("wb") as tmp:
-            shutil.copyfileobj(response, tmp)
-        os.replace(tmp_path, destination)
-    finally:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-
-
-def ensure_default_voice_available():
-    medium_path = VOICE_MODELS["medium"]
-    medium_config_path = Path(str(medium_path) + ".json")
-    if medium_path.exists() and medium_config_path.exists():
-        return
-
-    info = DEFAULT_VOICE_DOWNLOADS["medium"]
-
-    try:
-        if not medium_path.exists():
-            download_file(info["onnx"], medium_path)
-        if not medium_config_path.exists():
-            download_file(info["json"], medium_config_path)
-    except Exception as e:
-        raise FileNotFoundError(
-            "No Piper voice was found and automatic download failed.\n"
-            "You can manually download voices from:\n"
-            "https://rhasspy.github.io/piper-samples/\n"
-            "https://huggingface.co/rhasspy/piper-voices"
-        ) from e
-
-
-VOICE_CATALOG_CACHE = None
-VOICE_CATALOG_LOCK = threading.Lock()
-
-
-def fetch_voice_catalog(force_refresh: bool = False) -> dict:
-    global VOICE_CATALOG_CACHE
-
-    with VOICE_CATALOG_LOCK:
-        if VOICE_CATALOG_CACHE is not None and not force_refresh:
-            return VOICE_CATALOG_CACHE
-
-        req = urllib.request.Request(
-            VOICE_CATALOG_URL,
-            headers={"User-Agent": "speak-selection/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as response:
-            raw_catalog = json.load(response)
-
-        catalog = {}
-        for voice_key, entry in raw_catalog.items():
-            files = entry.get("files", {})
-            if not isinstance(files, dict):
-                continue
-
-            onnx_rel = ""
-            json_rel = ""
-            for rel_path in files.keys():
-                if rel_path.endswith(".onnx") and not rel_path.endswith(".onnx.json"):
-                    onnx_rel = rel_path
-                elif rel_path.endswith(".onnx.json"):
-                    json_rel = rel_path
-
-            if not onnx_rel or not json_rel:
-                continue
-
-            model_name = Path(onnx_rel).name
-            model_path = VOICE_DIR / model_name
-            config_path = VOICE_DIR / f"{model_name}.json"
-            catalog[voice_key] = {
-                "key": voice_key,
-                "language": str(entry.get("language", {}).get("code", "")),
-                "quality": str(entry.get("quality", "")),
-                "onnx_rel": onnx_rel,
-                "json_rel": json_rel,
-                "model_path": model_path,
-                "config_path": config_path,
-            }
-
-        VOICE_CATALOG_CACHE = catalog
-        return catalog
-
-
-def voice_catalog_entry_for_local_path(local_voice_path: Path):
-    local_name = local_voice_path.name
-    try:
-        catalog = fetch_voice_catalog()
-    except Exception:
-        return None
-
-    for entry in catalog.values():
-        model_path = entry.get("model_path")
-        if isinstance(model_path, Path) and model_path.name == local_name:
-            return entry
-    return None
-
-
-def is_voice_downloaded(entry: dict) -> bool:
-    model_path = entry.get("model_path")
-    config_path = entry.get("config_path")
-    return isinstance(model_path, Path) and isinstance(config_path, Path) and model_path.exists() and config_path.exists()
-
-
-def download_voice_from_catalog(voice_key: str) -> Path:
-    catalog = fetch_voice_catalog()
-    entry = catalog.get(voice_key)
-    if not entry:
-        raise ValueError(f"Voice key not found in catalog: {voice_key}")
-
-    model_path = entry["model_path"]
-    config_path = entry["config_path"]
-    if model_path.exists() and config_path.exists():
-        return model_path
-
-    onnx_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/main/{entry['onnx_rel']}"
-    json_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/main/{entry['json_rel']}"
-
-    download_file(onnx_url, model_path)
-    download_file(json_url, config_path)
-    return model_path
-
-
-def list_available_voice_paths() -> list[Path]:
-    if not VOICE_DIR.exists():
-        return []
-    return sorted(VOICE_DIR.glob("*.onnx"))
-
-
-def format_voice_label(voice_path: Path) -> str:
-    return voice_path.stem
-
-
-def detect_text_language(text: str) -> str:
-    if not AUTO_LANGUAGE_ROUTING:
-        return ""
-
-    text = normalize_text(text)
-    if len(text) < 12:
-        return ""
-
-    try:
-        from langdetect import detect
-    except Exception:
-        return ""
-
-    try:
-        detected = detect(text)
-    except Exception:
-        return ""
-
-    if not detected:
-        return ""
-
-    return detected.split("-")[0].lower()
-
-
-def find_voice_for_language(language_code: str):
-    language_code = language_code.strip().lower()
-    if not language_code:
-        return None
-
-    voices = list_available_voice_paths()
-    if not voices:
-        return None
-
-    prefix = f"{language_code}_"
-    matches = [voice for voice in voices if voice.stem.lower().startswith(prefix)]
-    if not matches:
-        return None
-
-    for quality in ("medium", "high"):
-        for voice in matches:
-            if f"-{quality}" in voice.stem.lower():
-                return voice
-
-    return matches[0]
-
-
-def get_voice_preference() -> str:
-    env_voice = os.environ.get("SPEAK_SELECTION_VOICE")
-    if env_voice is not None:
-        return env_voice.strip()
-
-    setting_voice = USER_SETTINGS.get("voice_preference")
-    if isinstance(setting_voice, str) and setting_voice.strip():
-        return setting_voice.strip()
-
-    return "auto"
-
-
-def low_memory_ort_enabled() -> bool:
-    return os.environ.get("SPEAK_SELECTION_LOW_MEMORY_ORT", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def get_voice_candidates(preference: Optional[str] = None) -> list[Path]:
-    if preference is None:
-        preference = get_voice_preference()
-    preference = preference.strip()
-
-    if not preference:
-        return [VOICE_MODELS[name] for name in DEFAULT_VOICE_ORDER]
-
-    pref_lower = preference.lower()
-    if pref_lower == "auto":
-        return [VOICE_MODELS[name] for name in DEFAULT_VOICE_ORDER]
-
-    if pref_lower in VOICE_MODELS:
-        ordered = [VOICE_MODELS[pref_lower]]
-        ordered.extend(
-            VOICE_MODELS[name] for name in DEFAULT_VOICE_ORDER if name != pref_lower
-        )
-        return ordered
-
-    preferred_path = Path(preference).expanduser()
-    candidates = [preferred_path]
-    candidates.extend(VOICE_MODELS[name] for name in DEFAULT_VOICE_ORDER)
-    return candidates
-
-
-def resolve_voice_path(preference: Optional[str] = None) -> Path:
-    candidates = get_voice_candidates(preference)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    pref_lower = (preference or "").strip().lower()
-    if not pref_lower or pref_lower in VOICE_MODELS:
-        ensure_default_voice_available()
-        candidates = get_voice_candidates(preference)
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-    raise FileNotFoundError(
-        "No Piper voice found. Expected one of:\n"
-        + "\n".join(str(candidate) for candidate in candidates)
-    )
-
-
-def choose_voice_path_for_text(text: str, preference: Optional[str] = None) -> Path:
-    if preference is None:
-        preference = get_voice_preference()
-
-    normalized_preference = preference.strip().lower()
-    if normalized_preference == "auto":
-        normalized_preference = ""
-
-    if normalized_preference:
-        return resolve_voice_path(preference)
-
-    language_code = detect_text_language(text)
-    language_voice = find_voice_for_language(language_code)
-    if language_voice is not None and language_voice.exists():
-        return language_voice
-
-    return get_voice_path()
-
-
-def synthesis_cache_key(text: str, voice_path: Path) -> str:
-    fingerprint = "|".join(
-        [
-            normalize_text(text),
-            str(voice_path.resolve()),
-            f"len={PIPER_LENGTH_SCALE}",
-            f"noise={NOISE_SCALE}",
-            f"noise_w={NOISE_W}",
-            f"post_boost={WAV_POST_BOOST_ENABLED}",
-            f"post_gain={WAV_POST_GAIN}",
-            f"post_peak={WAV_POST_PEAK}",
-            f"compress={WAV_COMPRESS_ENABLED}",
-            f"compress_threshold={WAV_COMPRESS_THRESHOLD}",
-            f"compress_ratio={WAV_COMPRESS_RATIO}",
-        ]
-    )
-    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
-
-
-def synthesis_cache_path(text: str, voice_path: Path) -> Path:
-    return CACHE_DIR / f"{synthesis_cache_key(text, voice_path)}.wav"
-
-
-def is_cache_audio_path(path: str) -> bool:
-    try:
-        resolved = Path(path).resolve()
-        return resolved.is_relative_to(CACHE_DIR.resolve())
-    except Exception:
-        return False
-
-def maybe_reexec_for_piper():
-    if os.environ.get("SPEAK_SELECTION_REEXECED") == "1":
-        return
-
-    try:
-        from piper.voice import PiperVoice  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        pass
-
-    candidates = [
-        Path.home() / "miniconda3" / "envs" / "speak-selection" / "bin" / "python3",
-        Path.home() / "miniconda3" / "envs" / "speak-selection" / "bin" / "python",
-    ]
-
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-
-        probe = subprocess.run(
-            [str(candidate), "-c", "from piper.voice import PiperVoice"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if probe.returncode == 0:
-            env = os.environ.copy()
-            env["SPEAK_SELECTION_REEXECED"] = "1"
-            os.execve(str(candidate), [str(candidate), *sys.argv], env)
-
 def normalize_text(text: str) -> str:
     return " ".join(text.replace("\r", "\n").split())
+
 
 def chunk_text_for_streaming(text: str) -> list[str]:
     text = normalize_text(text)
@@ -1044,8 +746,26 @@ def chunk_text_for_streaming(text: str) -> list[str]:
 
     return segments
 
-def get_voice_path() -> Path:
-    return resolve_voice_path()
+
+def split_text_for_low_latency(text: str) -> list[str]:
+    text = normalize_text(text)
+    if not text:
+        return []
+
+    if TTS_FIRST_CHUNK <= 0 or len(text) <= TTS_FIRST_CHUNK:
+        return chunk_text_for_streaming(text)
+
+    cutoff = text.rfind(" ", 0, TTS_FIRST_CHUNK + 1)
+    if cutoff < 20:
+        cutoff = TTS_FIRST_CHUNK
+
+    first = text[:cutoff].strip()
+    rest = text[cutoff:].strip()
+    segments = [first] if first else []
+    if rest:
+        segments.extend(chunk_text_for_streaming(rest))
+    return segments
+
 
 def _read_command_text(cmd: list[str], timeout: float) -> str:
     out = subprocess.check_output(
@@ -1243,13 +963,170 @@ def start_daemon():
     )
 
 
+def detect_text_language(text: str) -> str:
+    if not AUTO_LANGUAGE_ROUTING:
+        return ""
+
+    text = normalize_text(text)
+    if len(text) < 12:
+        return ""
+
+    try:
+        from langdetect import detect
+    except Exception:
+        return ""
+
+    try:
+        detected = detect(text)
+    except Exception:
+        return ""
+
+    if not detected:
+        return ""
+
+    return detected.split("-")[0].lower()
+
+
+def resolve_language(text: str) -> str:
+    language_code = detect_text_language(text)
+    if language_code:
+        return language_code
+    return "na"
+
+
+def sanitize_voice_preference(preference: str) -> str:
+    pref = (preference or "").strip()
+    if not pref:
+        return "auto"
+    if pref.lower() == "auto":
+        return "auto"
+
+    pref_upper = pref.upper()
+    if pref_upper in BUILTIN_VOICES:
+        return pref_upper
+
+    if pref.lower().endswith(".onnx"):
+        return "auto"
+
+    try:
+        path = Path(pref).expanduser()
+    except Exception:
+        return pref
+
+    if path.exists() and path.suffix.lower() != ".json":
+        return "auto"
+
+    return pref
+
+
+def get_voice_preference() -> str:
+    env_voice = os.environ.get("SPEAK_SELECTION_VOICE")
+    if env_voice is not None:
+        return sanitize_voice_preference(env_voice)
+
+    setting_voice = USER_SETTINGS.get("voice_preference")
+    if isinstance(setting_voice, str) and setting_voice.strip():
+        sanitized = sanitize_voice_preference(setting_voice)
+        if sanitized == "auto" and setting_voice.strip().lower() != "auto":
+            update_user_settings({"voice_preference": "auto"})
+        return sanitized
+
+    return "auto"
+
+
+def list_voice_style_paths() -> list[Path]:
+    seen = set()
+    results: list[Path] = []
+    for voice_dir in VOICE_STYLE_DIRS:
+        if not voice_dir.exists():
+            continue
+        for path in sorted(voice_dir.glob("*.json")):
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(path)
+    return results
+
+
+def find_voice_style_by_name(name: str) -> Optional[Path]:
+    if not name:
+        return None
+
+    name_lower = name.lower()
+    for path in list_voice_style_paths():
+        if path.stem.lower() == name_lower:
+            return path
+    return None
+
+
+def format_voice_label(voice_path: Path) -> str:
+    return voice_path.stem
+
+
+def write_wav_16bit(path: str, wav_data) -> None:
+    try:
+        import soundfile as sf
+    except Exception as e:
+        raise RuntimeError(
+            "Supertonic audio output requires the 'soundfile' package."
+        ) from e
+
+    try:
+        data = wav_data.squeeze() if hasattr(wav_data, "squeeze") else wav_data
+    except Exception:
+        data = wav_data
+
+    sf.write(path, data, 44100, subtype="PCM_16")
+
+
+def synthesis_cache_key(text: str, voice_label: str, lang: str) -> str:
+    fingerprint = "|".join(
+        [
+            normalize_text(text),
+            voice_label,
+            f"lang={lang}",
+            f"tts_speed={TTS_SPEED}",
+            f"tts_steps={TTS_STEPS}",
+            f"tts_max_chunk={TTS_MAX_CHUNK}",
+            f"tts_silence={TTS_SILENCE_DURATION}",
+            f"post_boost={WAV_POST_BOOST_ENABLED}",
+            f"post_gain={WAV_POST_GAIN}",
+            f"post_peak={WAV_POST_PEAK}",
+            f"compress={WAV_COMPRESS_ENABLED}",
+            f"compress_threshold={WAV_COMPRESS_THRESHOLD}",
+            f"compress_ratio={WAV_COMPRESS_RATIO}",
+        ]
+    )
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+
+def synthesis_cache_path(text: str, voice_label: str, lang: str) -> Path:
+    return CACHE_DIR / f"{synthesis_cache_key(text, voice_label, lang)}.wav"
+
+
+def is_cache_audio_path(path: str) -> bool:
+    try:
+        resolved = Path(path).resolve()
+        return resolved.is_relative_to(CACHE_DIR.resolve())
+    except Exception:
+        return False
+
+
 def make_speak_payload(text: str, voice_preference: str = "") -> dict:
     normalized = normalize_text(text)
+    lang = resolve_language(normalized) if normalized else ""
     settings = current_audio_settings()
     return {
         "cmd": "speak",
         "text": normalized,
-        "hash": compute_request_hash(normalized, voice_preference=voice_preference, audio_settings=settings)
+        "lang": lang,
+        "hash": compute_request_hash(
+            normalized,
+            voice_preference=voice_preference,
+            audio_settings=settings,
+            lang=lang,
+        )
         if normalized
         else "",
         "voice": voice_preference.strip(),
@@ -1383,71 +1260,36 @@ def send_control_command(cmd: str, **extra_fields):
     return send_request_with_daemon_start(payload, timeout=2.0)
 
 
-def _voice_option_items(catalog: Optional[dict] = None) -> list[dict]:
+def _voice_option_items() -> list[dict]:
     options = [
         {
             "id": "auto",
             "label": "[Default] Auto language + fallback",
             "preference": "auto",
-            "catalog_key": "",
             "path": None,
+            "built_in": True,
         }
     ]
 
-    known_model_names = set()
+    for voice_name in BUILTIN_VOICES:
+        options.append(
+            {
+                "id": f"builtin:{voice_name}",
+                "label": f"[Built-in] {voice_name}",
+                "preference": voice_name,
+                "path": None,
+                "built_in": True,
+            }
+        )
 
-    if isinstance(catalog, dict) and catalog:
-        for voice_key in sorted(catalog.keys()):
-            entry = catalog.get(voice_key, {})
-            model_path = entry.get("model_path")
-            if not isinstance(model_path, Path):
-                continue
-
-            known_model_names.add(model_path.name)
-            downloaded = is_voice_downloaded(entry)
-            language = str(entry.get("language", "")).strip()
-            quality = str(entry.get("quality", "")).strip()
-
-            detail_parts = [part for part in (language, quality) if part]
-            detail = f" ({', '.join(detail_parts)})" if detail_parts else ""
-            prefix = "[Downloaded]" if downloaded else "[Download]"
-
-            options.append(
-                {
-                    "id": f"catalog:{voice_key}",
-                    "label": f"{prefix} {voice_key}{detail}",
-                    "preference": str(model_path),
-                    "catalog_key": voice_key,
-                    "path": model_path,
-                }
-            )
-    else:
-        for name in DEFAULT_VOICE_ORDER:
-            voice_path = VOICE_MODELS[name]
-            config_path = Path(str(voice_path) + ".json")
-            downloaded = voice_path.exists() and config_path.exists()
-            prefix = "[Downloaded]" if downloaded else "[Download]"
-            options.append(
-                {
-                    "id": f"alias:{name}",
-                    "label": f"{prefix} English {name.title()} ({voice_path.stem})",
-                    "preference": name,
-                    "catalog_key": "",
-                    "path": voice_path,
-                }
-            )
-            known_model_names.add(voice_path.name)
-
-    for voice_path in list_available_voice_paths():
-        if voice_path.name in known_model_names:
-            continue
+    for voice_path in list_voice_style_paths():
         options.append(
             {
                 "id": f"path:{voice_path}",
-                "label": f"[Downloaded] Local: {format_voice_label(voice_path)}",
+                "label": f"[Custom] {format_voice_label(voice_path)}",
                 "preference": str(voice_path),
-                "catalog_key": "",
                 "path": voice_path,
+                "built_in": False,
             }
         )
 
@@ -1466,12 +1308,10 @@ def _pick_voice_option_id(options: list[dict], voice_preference: str) -> str:
         if str(option.get("preference", "")).strip() == preference:
             return str(option.get("id", "auto"))
 
-    pref_lower = preference.lower()
-    if pref_lower in VOICE_MODELS:
-        alias_path = VOICE_MODELS[pref_lower]
+    pref_upper = preference.upper()
+    if pref_upper in BUILTIN_VOICES:
         for option in options:
-            option_path = option.get("path")
-            if isinstance(option_path, Path) and option_path.name == alias_path.name:
+            if option.get("preference") == pref_upper:
                 return str(option.get("id", "auto"))
 
     try:
@@ -1651,7 +1491,7 @@ def settings_ui_main():
     speed_var = tk.DoubleVar(
         value=clamp_float(float(audio.get("playback_speed", 1.0)), 0.25, 4.0)
     )
-    status_var = tk.StringVar(value="Loading voices...")
+    status_var = tk.StringVar(value="Ready.")
     volume_value_var = tk.StringVar(value=f"{int(round(volume_var.get()))}%")
     speed_value_var = tk.StringVar(value=f"{speed_var.get():.2f}x")
 
@@ -1669,7 +1509,7 @@ def settings_ui_main():
     )
     ttk.Label(
         frame,
-        text="Changes save instantly. Pick a voice to auto-download and switch.",
+        text="Changes save instantly. Pick a voice to use in playback.",
         style="Muted.TLabel",
     ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 10))
 
@@ -1733,7 +1573,7 @@ def settings_ui_main():
 
     ttk.Label(
         frame,
-        text="Voices marked [Download] will be downloaded when selected.",
+        text="Custom voices appear from ~/.cache/supertonic3 or SPEAK_SELECTION_VOICE_DIR.",
         style="Muted.TLabel",
     ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
@@ -1777,8 +1617,8 @@ def settings_ui_main():
             "id": "auto",
             "label": "[Default] Auto language + fallback",
             "preference": "auto",
-            "catalog_key": "",
             "path": None,
+            "built_in": True,
         }
 
     def ui_audio_settings() -> dict:
@@ -1816,9 +1656,9 @@ def settings_ui_main():
 
             labels = list(voice_combo["values"])
             for idx, label in enumerate(labels):
-                is_downloaded = str(label).startswith("[Downloaded]")
-                row_bg = "#edf7ef" if is_downloaded else input_bg
-                row_fg = "#2f6f49" if is_downloaded else text_primary
+                is_builtin = str(label).startswith("[Built-in]")
+                row_bg = "#edf2ff" if is_builtin else input_bg
+                row_fg = "#1f3a8a" if is_builtin else text_primary
                 try:
                     voice_combo.tk.call(
                         listbox_path,
@@ -1830,7 +1670,6 @@ def settings_ui_main():
                         row_fg,
                     )
                 except Exception:
-                    # Some Tk builds don't support per-row listbox styling.
                     continue
         except Exception:
             pass
@@ -1843,7 +1682,7 @@ def settings_ui_main():
         except Exception:
             pass
 
-    def populate_voice_choices(options: list[dict], catalog_loaded: bool):
+    def populate_voice_choices(options: list[dict]):
         voice_label_to_option.clear()
         for option in options:
             voice_label_to_option[option["label"]] = option
@@ -1865,33 +1704,10 @@ def settings_ui_main():
             voice_choice_var.set(selected["label"])
 
         restyle_voice_dropdown_items()
+        status_var.set("Ready.")
 
-        if catalog_loaded:
-            status_var.set("Ready.")
-        else:
-            status_var.set("Voice catalog unavailable. Showing installed/local voices only.")
-
-    def load_voices_async(force_refresh: bool = False):
-        status_var.set("Loading voices...")
-
-        def _worker():
-            catalog = None
-            try:
-                catalog = fetch_voice_catalog(force_refresh=force_refresh)
-            except Exception:
-                catalog = None
-
-            options = _voice_option_items(catalog)
-
-            def _apply_result():
-                populate_voice_choices(options, catalog_loaded=bool(catalog))
-
-            try:
-                root.after(0, _apply_result)
-            except Exception:
-                pass
-
-        threading.Thread(target=_worker, daemon=True).start()
+    def refresh_voice_list():
+        populate_voice_choices(_voice_option_items())
 
     def apply_audio_only_async():
         audio_settings = ui_audio_settings()
@@ -1936,35 +1752,12 @@ def settings_ui_main():
         def _worker():
             try:
                 chosen_preference = str(selected.get("preference", "auto"))
-                catalog_key = str(selected.get("catalog_key", "")).strip()
-                downloaded_now = False
 
                 with apply_lock:
-                    if catalog_key:
-                        catalog = fetch_voice_catalog()
-                        entry = catalog.get(catalog_key)
-                        if not entry:
-                            raise RuntimeError(f"Voice not found in catalog: {catalog_key}")
-                        if not is_voice_downloaded(entry):
-                            downloaded_now = True
-                            root.after(
-                                0,
-                                lambda: status_var.set(f"Downloading voice: {catalog_key} ..."),
-                            )
-                            model_path = download_voice_from_catalog(catalog_key)
-                        else:
-                            model_path = entry.get("model_path")
-
-                        if not isinstance(model_path, Path):
-                            raise RuntimeError(f"Invalid voice path for {catalog_key}")
-                        chosen_preference = str(model_path)
-
                     save_audio_settings(requested_audio, voice_preference=chosen_preference)
 
                 def _done():
                     status_var.set("Saved.")
-                    if downloaded_now:
-                        load_voices_async(force_refresh=False)
 
                 root.after(0, _done)
             except Exception as e:
@@ -1997,11 +1790,9 @@ def settings_ui_main():
     samples_link.bind("<Enter>", lambda _event: samples_link.configure(foreground="#1e40af"))
     samples_link.bind("<Leave>", lambda _event: samples_link.configure(foreground="#1d4ed8"))
     revert_button.configure(command=on_revert_defaults)
-    refresh_button.configure(command=lambda: load_voices_async(force_refresh=True))
+    refresh_button.configure(command=refresh_voice_list)
 
-    populate_voice_choices(_voice_option_items(None), catalog_loaded=False)
-    status_var.set("Loading voice catalog...")
-    load_voices_async(force_refresh=False)
+    populate_voice_choices(_voice_option_items())
     root.bind("<Escape>", lambda _event: root.destroy())
 
     try:
@@ -2025,7 +1816,7 @@ def tray_main():
 
     try:
         import pystray
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
     except Exception as e:
         raise SystemExit(
             "Tray mode requires extra packages.\n"
@@ -2041,38 +1832,9 @@ def tray_main():
         image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(20, 24, 32, 255))
-
-        font_candidates = []
-        if sys.platform == "linux":
-            font_candidates.extend(
-                [
-                    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-                    "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
-                    "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
-                ]
-            )
-        elif sys.platform == "darwin":
-            font_candidates.extend(
-                [
-                    "/System/Library/Fonts/Apple Color Emoji.ttc",
-                    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-                ]
-            )
-
-        for font_path in font_candidates:
-            try:
-                font = ImageFont.truetype(font_path, 44)
-                draw.text((32, 31), "🗣️", font=font, anchor="mm", embedded_color=True)
-                return image
-            except Exception:
-                continue
-
-        # Fallback if emoji fonts are unavailable.
-        draw.ellipse((10, 10, 54, 54), fill=(39, 174, 96, 255))
-        draw.polygon([(24, 26), (33, 20), (33, 42), (24, 36)], fill=(245, 245, 245, 255))
-        draw.rectangle((20, 27, 25, 35), fill=(245, 245, 245, 255))
-        draw.arc((33, 22, 49, 40), start=300, end=60, fill=(245, 245, 245, 255), width=3)
-        draw.arc((35, 18, 55, 44), start=300, end=60, fill=(245, 245, 245, 200), width=2)
+        draw.ellipse((12, 12, 52, 52), fill=(59, 130, 246, 255))
+        draw.polygon([(26, 24), (40, 32), (26, 40)], fill=(245, 245, 245, 255))
+        draw.rectangle((22, 26, 26, 38), fill=(245, 245, 245, 255))
         return image
 
     def action_speak(icon, item):
@@ -2128,6 +1890,7 @@ def client_main():
 
     speak_selection_with_daemon()
 
+
 def speak_text_direct(text: str, voice_preference: str = ""):
     text = normalize_text(text)
     if not text:
@@ -2135,9 +1898,9 @@ def speak_text_direct(text: str, voice_preference: str = ""):
 
     daemon = Daemon()
     atexit.register(daemon.cleanup)
-    voice_path = choose_voice_path_for_text(text, voice_preference or get_voice_preference())
-    voice = daemon.load_voice(voice_path)
-    path = daemon.synthesize_to_temp(text, voice=voice, voice_path=voice_path)
+    lang = resolve_language(text)
+    voice_style, voice_label = daemon.resolve_voice_style(voice_preference or get_voice_preference())
+    path = daemon.synthesize_to_temp(text, voice_style=voice_style, voice_label=voice_label, lang=lang)
     daemon.current_temp = path
     daemon.active_temps = [path]
 
@@ -2175,10 +1938,10 @@ def speak_text_direct(text: str, voice_preference: str = ""):
             except Exception:
                 pass
 
+
 class Daemon:
     def __init__(self):
         self.voice_cache = {}
-        self.voice_path = None
         self.server = None
         self.mpv_proc = None
         self.current_hash = ""
@@ -2189,61 +1952,60 @@ class Daemon:
         self.request_serial = 0
         self.state_lock = threading.Lock()
         self.voice_preference_override = ""
+        self.tts = None
 
-    def load_voice(self, voice_path: Optional[Path] = None):
+    def get_tts(self):
+        if self.tts is not None:
+            return self.tts
+
         try:
-            from piper.voice import PiperVoice
+            from supertonic import TTS
         except Exception as e:
             raise RuntimeError(
-                "This script uses Piper's Python API for speed.\n"
+                "This script uses Supertonic for TTS.\n"
                 "Install it with:\n"
-                "python3 -m pip install --user piper-tts"
+                "python3 -m pip install supertonic soundfile"
             ) from e
 
-        if voice_path is None:
-            voice_path = get_voice_path()
-        voice_path = voice_path.expanduser()
+        self.tts = TTS(auto_download=True)
+        return self.tts
 
-        cache_key = str(voice_path.resolve())
+    def resolve_voice_style(self, preference: Optional[str] = None):
+        if preference is None:
+            preference = get_voice_preference()
+
+        preference = sanitize_voice_preference(preference)
+        if not preference or preference.lower() == "auto":
+            preference = DEFAULT_VOICE_NAME
+
+        cache_key = preference
         if cache_key in self.voice_cache:
-            self.voice_path = voice_path
             return self.voice_cache[cache_key]
 
-        config_path = Path(str(voice_path) + ".json")
-        if not config_path.exists():
+        tts = self.get_tts()
+        pref_upper = preference.upper()
+        if pref_upper in BUILTIN_VOICES:
+            style = tts.get_voice_style(voice_name=pref_upper)
+            result = (style, pref_upper)
+            self.voice_cache[cache_key] = result
+            return result
+
+        preferred_path = Path(preference).expanduser()
+        if not preferred_path.exists():
+            matched = find_voice_style_by_name(preference)
+            if matched is not None:
+                preferred_path = matched
+
+        if not preferred_path.exists():
             raise FileNotFoundError(
-                f"Missing Piper voice config next to voice file: {config_path}"
+                f"Supertonic voice style not found: {preference}"
             )
 
-        if low_memory_ort_enabled():
-            import onnxruntime
-            from piper.config import PiperConfig
-
-            with config_path.open("r", encoding="utf-8") as config_file:
-                config_dict = json.load(config_file)
-
-            sess_options = onnxruntime.SessionOptions()
-            sess_options.enable_cpu_mem_arena = False
-
-            voice = PiperVoice(
-                config=PiperConfig.from_dict(config_dict),
-                session=onnxruntime.InferenceSession(
-                    str(voice_path),
-                    sess_options=sess_options,
-                    providers=["CPUExecutionProvider"],
-                ),
-                download_dir=Path.cwd(),
-            )
-        else:
-            voice = PiperVoice.load(str(voice_path), config_path=str(config_path))
-
-        self.voice_cache[cache_key] = voice
-        self.voice_path = voice_path
-        while len(self.voice_cache) > 4:
-            oldest_key = next(iter(self.voice_cache))
-            self.voice_cache.pop(oldest_key, None)
-
-        return voice
+        style = tts.get_voice_style_from_path(str(preferred_path))
+        label = str(preferred_path)
+        result = (style, label)
+        self.voice_cache[cache_key] = result
+        return result
 
     def start_mpv(self):
         ensure_state_dir()
@@ -2329,45 +2091,74 @@ class Daemon:
         paused = self.is_paused()
         self.mpv_command("set_property", "pause", not paused)
 
-    def get_synthesis_config(self):
-        from piper.config import SynthesisConfig
-
-        return SynthesisConfig(
-            speaker_id=None,
-            length_scale=PIPER_LENGTH_SCALE,
-            noise_scale=NOISE_SCALE,
-            noise_w_scale=NOISE_W,
-        )
-
     def synthesize_text_to_file(
         self,
         text: str,
         output_path: str,
-        voice,
-        syn_config=None,
+        voice_style,
+        lang: str,
         segment_text: bool = False,
     ):
-        if syn_config is None:
-            syn_config = self.get_synthesis_config()
-
+        tts = self.get_tts()
         units = chunk_text_for_streaming(text) if segment_text else [normalize_text(text)]
         if not units:
             raise RuntimeError("No text to synthesize.")
 
-        with wave.open(output_path, "wb") as wav_file:
-            first_chunk = True
-            for unit in units:
-                for audio_chunk in voice.synthesize(unit, syn_config=syn_config):
-                    if first_chunk:
-                        wav_file.setframerate(audio_chunk.sample_rate)
-                        wav_file.setsampwidth(audio_chunk.sample_width)
-                        wav_file.setnchannels(audio_chunk.sample_channels)
-                        first_chunk = False
+        if len(units) == 1:
+            wav, _ = tts.synthesize(
+                text=units[0],
+                voice_style=voice_style,
+                total_steps=TTS_STEPS,
+                speed=TTS_SPEED,
+                max_chunk_length=TTS_MAX_CHUNK,
+                silence_duration=TTS_SILENCE_DURATION,
+                lang=lang,
+                verbose=False,
+            )
+            write_wav_16bit(output_path, wav)
+            return
 
-                    wav_file.writeframes(audio_chunk.audio_int16_bytes)
+        fd, tmp_path = tempfile.mkstemp(prefix="speak-selection-join-", suffix=".wav", dir=str(STATE_DIR))
+        os.close(fd)
 
-            if first_chunk:
-                raise RuntimeError("Piper returned no audio chunks.")
+        try:
+            with wave.open(tmp_path, "wb") as wav_out:
+                first_chunk = True
+                for unit in units:
+                    wav, _ = tts.synthesize(
+                        text=unit,
+                        voice_style=voice_style,
+                        total_steps=TTS_STEPS,
+                        speed=TTS_SPEED,
+                        max_chunk_length=TTS_MAX_CHUNK,
+                        silence_duration=TTS_SILENCE_DURATION,
+                        lang=lang,
+                        verbose=False,
+                    )
+                    segment_path = tempfile.mktemp(prefix="speak-selection-seg-", suffix=".wav", dir=str(STATE_DIR))
+                    write_wav_16bit(segment_path, wav)
+
+                    with wave.open(segment_path, "rb") as wav_in:
+                        if first_chunk:
+                            wav_out.setframerate(wav_in.getframerate())
+                            wav_out.setsampwidth(wav_in.getsampwidth())
+                            wav_out.setnchannels(wav_in.getnchannels())
+                            first_chunk = False
+                        wav_out.writeframes(wav_in.readframes(wav_in.getnframes()))
+
+                    try:
+                        os.remove(segment_path)
+                    except FileNotFoundError:
+                        pass
+
+            os.replace(tmp_path, output_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
 
     def prune_cache_files(self):
         if not CACHE_ENABLED:
@@ -2391,13 +2182,10 @@ class Daemon:
             except Exception:
                 pass
 
-    def synthesize_segment_to_temp(self, text: str, voice, voice_path: Path, syn_config=None) -> str:
-        if syn_config is None:
-            syn_config = self.get_synthesis_config()
-
+    def synthesize_segment_to_temp(self, text: str, voice_style, voice_label: str, lang: str) -> str:
         if CACHE_ENABLED:
             ensure_cache_dir()
-            cache_path = synthesis_cache_path(text, voice_path)
+            cache_path = synthesis_cache_path(text, voice_label, lang)
             if cache_path.exists():
                 try:
                     os.utime(cache_path, None)
@@ -2413,7 +2201,7 @@ class Daemon:
             os.close(fd)
 
             try:
-                self.synthesize_text_to_file(text, tmp_path, voice, syn_config=syn_config)
+                self.synthesize_text_to_file(text, tmp_path, voice_style, lang=lang, segment_text=False)
                 apply_post_gain_to_wav(tmp_path)
                 os.replace(tmp_path, cache_path)
                 self.prune_cache_files()
@@ -2434,7 +2222,7 @@ class Daemon:
         os.close(fd)
 
         try:
-            self.synthesize_text_to_file(text, path, voice, syn_config=syn_config)
+            self.synthesize_text_to_file(text, path, voice_style, lang=lang, segment_text=False)
             apply_post_gain_to_wav(path)
             return path
         except Exception:
@@ -2444,12 +2232,10 @@ class Daemon:
                 pass
             raise
 
-    def synthesize_to_temp(self, text: str, voice, voice_path: Path) -> str:
-        syn_config = self.get_synthesis_config()
-
+    def synthesize_to_temp(self, text: str, voice_style, voice_label: str, lang: str) -> str:
         if CACHE_ENABLED:
             ensure_cache_dir()
-            cache_path = synthesis_cache_path(text, voice_path)
+            cache_path = synthesis_cache_path(text, voice_label, lang)
             if cache_path.exists():
                 try:
                     os.utime(cache_path, None)
@@ -2468,8 +2254,8 @@ class Daemon:
                 self.synthesize_text_to_file(
                     text,
                     tmp_path,
-                    voice,
-                    syn_config=syn_config,
+                    voice_style,
+                    lang=lang,
                     segment_text=True,
                 )
                 apply_post_gain_to_wav(tmp_path)
@@ -2495,8 +2281,8 @@ class Daemon:
             self.synthesize_text_to_file(
                 text,
                 path,
-                voice,
-                syn_config=syn_config,
+                voice_style,
+                lang=lang,
                 segment_text=True,
             )
             apply_post_gain_to_wav(path)
@@ -2549,7 +2335,7 @@ class Daemon:
         self.mpv_command("playlist-clear")
         self.cleanup_temp_files()
 
-    def queue_text(self, text: str, text_hash: str, voice_preference: str = ""):
+    def queue_text(self, text: str, text_hash: str, voice_preference: str = "", lang: str = "na"):
         self.cancel_current_request()
 
         effective_preference = (
@@ -2557,8 +2343,7 @@ class Daemon:
             or self.voice_preference_override.strip()
             or get_voice_preference()
         )
-        voice_path = choose_voice_path_for_text(text, preference=effective_preference)
-        voice = self.load_voice(voice_path)
+        voice_style, voice_label = self.resolve_voice_style(effective_preference)
 
         with self.state_lock:
             request_id = self.request_serial
@@ -2566,17 +2351,16 @@ class Daemon:
 
         worker = threading.Thread(
             target=self._synthesize_and_queue,
-            args=(request_id, text, text_hash, voice, voice_path),
+            args=(request_id, text, text_hash, voice_style, voice_label, lang),
             daemon=True,
         )
         worker.start()
 
-    def _synthesize_and_queue(self, request_id: int, text: str, text_hash: str, voice, voice_path: Path):
-        syn_config = self.get_synthesis_config()
+    def _synthesize_and_queue(self, request_id: int, text: str, text_hash: str, voice_style, voice_label: str, lang: str):
         playback_started = False
         queued_paths = []
-        segments = chunk_text_for_streaming(text)
-        initial_buffer_segments = 2 if len(segments) > 1 else 1
+        segments = split_text_for_low_latency(text)
+        initial_buffer_segments = max(1, min(INITIAL_BUFFER_SEGMENTS, len(segments)))
 
         try:
             for segment in segments:
@@ -2585,9 +2369,9 @@ class Daemon:
 
                 path = self.synthesize_segment_to_temp(
                     segment,
-                    voice=voice,
-                    voice_path=voice_path,
-                    syn_config=syn_config,
+                    voice_style=voice_style,
+                    voice_label=voice_label,
+                    lang=lang,
                 )
 
                 if not self.is_request_current(request_id):
@@ -2638,26 +2422,22 @@ class Daemon:
         finally:
             self.cleanup_temp_files()
 
-    def handle_speak(self, text: str, text_hash: str, voice_preference: str = ""):
+    def handle_speak(self, text: str, text_hash: str, voice_preference: str = "", lang: str = "na"):
         self.ensure_mpv()
 
-        # No current selection: toggle pause/resume on current playback
         if not text:
             if EMPTY_SELECTION_TOGGLES:
                 self.toggle_pause()
             return
 
-        # Same selected text: toggle pause/resume
         if text_hash == self.current_hash or text_hash == self.pending_hash:
-            # If playback already finished, replay from the beginning.
             if self.is_idle():
-                self.queue_text(text, text_hash, voice_preference=voice_preference)
+                self.queue_text(text, text_hash, voice_preference=voice_preference, lang=lang)
             else:
                 self.toggle_pause()
             return
 
-        # New selected text: replace current playback immediately
-        self.queue_text(text, text_hash, voice_preference=voice_preference)
+        self.queue_text(text, text_hash, voice_preference=voice_preference, lang=lang)
 
     def handle_stop(self):
         self.cancel_current_request()
@@ -2718,7 +2498,7 @@ class Daemon:
         ensure_cache_dir()
         atexit.register(self.cleanup)
 
-        self.load_voice(get_voice_path())
+        self.resolve_voice_style(get_voice_preference())
         self.start_mpv()
 
         try:
@@ -2766,6 +2546,7 @@ class Daemon:
                             payload.get("text", ""),
                             payload.get("hash", ""),
                             payload.get("voice", ""),
+                            payload.get("lang", "na"),
                         )
                     elif cmd == "pause":
                         self.toggle_pause()
@@ -2778,9 +2559,8 @@ class Daemon:
                 except Exception:
                     continue
 
-if __name__ == "__main__":
-    maybe_reexec_for_piper()
 
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--daemon", action="store_true")
     parser.add_argument(
@@ -2810,12 +2590,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--voice",
-        help="Voice preference: auto, medium, high, or /path/to/voice.onnx",
+        help="Voice preference: auto, M1..M5, F1..F5, or /path/to/voice.json",
     )
     parser.add_argument(
         "--set-runtime-voice",
         metavar="VOICE",
-        help="Set daemon voice override: auto, medium, high, or /path/to/voice.onnx",
+        help="Set daemon voice override: auto, M1..M5, F1..F5, or /path/to/voice.json",
     )
     parser.add_argument(
         "--pause",
@@ -2830,12 +2610,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--list-voices",
         action="store_true",
-        help="List available .onnx voices in the voice folder.",
+        help="List available Supertonic voices and local voice JSON files.",
     )
     parser.add_argument(
         "--low-memory-ort",
         action="store_true",
-        help="Reduce ONNX memory by disabling the CPU memory arena.",
+        help="Deprecated (no-op in Supertonic mode).",
     )
     parser.add_argument(
         "--test",
@@ -2850,8 +2630,9 @@ if __name__ == "__main__":
         os.environ["SPEAK_SELECTION_LOW_MEMORY_ORT"] = "1"
 
     if args.list_voices:
-        ensure_default_voice_available()
-        for voice_path in list_available_voice_paths():
+        for voice in BUILTIN_VOICES:
+            print(f"- {voice}")
+        for voice_path in list_voice_style_paths():
             print(f"- {voice_path}")
         raise SystemExit(0)
     if args.diagnose_audio is not None:

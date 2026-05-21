@@ -10,7 +10,7 @@ Designed for people who want reading support (for example dyslexia, eye strain, 
 - Works on Linux, macOS, and Windows.
 - Tray/menu controls on Linux/macOS (pause, stop, settings).
 - Settings window for speed, volume, and voice.
-- Auto-downloads a default voice if none is installed (`en_US-lessac-medium`).
+- Auto-downloads Supertonic model + built-in voices on first run (~400MB).
 
 ## Quick Setup
 
@@ -44,7 +44,7 @@ Linux/macOS:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install piper-tts onnxruntime langdetect pystray pillow
+python -m pip install supertonic soundfile langdetect pystray pillow
 ```
 
 Windows:
@@ -53,7 +53,7 @@ Windows:
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install piper-tts onnxruntime langdetect
+python -m pip install supertonic soundfile langdetect
 ```
 
 ## Run
@@ -128,10 +128,10 @@ Quick test:
 
 ## Voices
 
-- Voice samples: https://rhasspy.github.io/piper-samples/
-- Voice downloads: https://huggingface.co/rhasspy/piper-voices
-- The app auto-downloads `en_US-lessac-medium` if no voice is installed.
-- Install additional voices for better multi-language support.
+- Voice samples: https://supertonic3.github.io/
+- Built-in voices: M1-M5, F1-F5.
+- Custom voices: point `SPEAK_SELECTION_VOICE` to a Supertonic voice JSON (Voice Builder export).
+- Custom voice JSONs are stored in `~/.cache/supertonic3/voice_styles` and `~/.cache/supertonic3/custom_styles`.
 
 ## Useful Commands
 
