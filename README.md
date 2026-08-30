@@ -47,6 +47,8 @@ python -m pip install --upgrade pip
 python -m pip install supertonic soundfile langdetect pystray pillow
 ```
 
+The Linux and macOS launchers try `.venv` first, then an active Conda environment, then `conda run -n speak-selection`, and finally system `python3`/`python`.
+
 Windows:
 
 ```powershell
@@ -153,3 +155,21 @@ pkill -f "speak-selection.py --settings-ui" || true
 pkill -f "speak-selection.py --tray" || true
 ./scripts/run-linux.sh
 ```
+
+### CPU usage and responsiveness
+
+Speech generation is deliberately limited to two CPU workers and runs at a
+lower background priority on Linux/macOS so it does not monopolize the desktop.
+You can tune this without editing the script:
+
+```bash
+# Use one worker on a very resource-constrained machine
+SPEAK_SELECTION_CPU_THREADS=1 ./scripts/run-linux.sh
+
+# Trade more CPU for faster generation
+SPEAK_SELECTION_CPU_THREADS=4 ./scripts/run-linux.sh
+```
+
+`SPEAK_SELECTION_PROCESS_NICE` controls the Unix background priority adjustment
+(`5` by default; `0` disables it). Restart the daemon after changing either
+setting.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import atexit
 import argparse
+import functools
 import html
 import hashlib
 import json
@@ -18,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+import unicodedata
 from array import array
 from pathlib import Path
 from typing import Optional
@@ -127,9 +129,43 @@ CACHE_ENABLED = env_bool("SPEAK_SELECTION_CACHE_ENABLED", True)
 CACHE_MAX_FILES = max(20, env_int("SPEAK_SELECTION_CACHE_MAX_FILES", 800))
 AUTO_LANGUAGE_ROUTING = env_bool("SPEAK_SELECTION_AUTO_LANGUAGE", True)
 AUTO_TRAY_ENABLED = env_bool("SPEAK_SELECTION_AUTO_TRAY", True)
+TTS_CPU_THREADS = max(1, min(16, env_int("SPEAK_SELECTION_CPU_THREADS", 2)))
+TTS_INTER_OP_THREADS = max(1, min(4, env_int("SPEAK_SELECTION_INTER_OP_THREADS", 1)))
+TTS_PROCESS_NICE = max(0, min(19, env_int("SPEAK_SELECTION_PROCESS_NICE", 5)))
+CACHE_PRUNE_INTERVAL = max(
+    5.0,
+    min(600.0, env_float("SPEAK_SELECTION_CACHE_PRUNE_INTERVAL", 60.0)),
+)
 
 BUILTIN_VOICES = ["M1", "M2", "M3", "M4", "M5", "F1", "F2", "F3", "F4", "F5"]
 DEFAULT_VOICE_NAME = "M1"
+DEFAULT_LANGUAGE_PREFERENCE = "auto"
+LANGUAGE_OPTIONS = [
+    ("auto", "Auto detect"),
+    ("en", "English"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("nl", "Dutch"),
+    ("sv", "Swedish"),
+    ("no", "Norwegian"),
+    ("da", "Danish"),
+    ("fi", "Finnish"),
+    ("pl", "Polish"),
+    ("cs", "Czech"),
+    ("tr", "Turkish"),
+    ("ru", "Russian"),
+    ("uk", "Ukrainian"),
+    ("el", "Greek"),
+    ("ar", "Arabic"),
+    ("he", "Hebrew"),
+    ("hi", "Hindi"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("zh", "Chinese"),
+]
 
 def derive_tts_speed() -> float:
     env_speed = os.environ.get("SPEAK_SELECTION_TTS_SPEED")
@@ -155,8 +191,9 @@ TTS_SPEED = max(0.7, min(2.0, derive_tts_speed()))
 TTS_STEPS = max(5, min(12, env_int("SPEAK_SELECTION_TTS_STEPS", 5)))
 TTS_MAX_CHUNK = max(80, min(600, env_int("SPEAK_SELECTION_TTS_MAX_CHUNK", 220)))
 TTS_SILENCE_DURATION = max(0.0, min(2.0, env_float("SPEAK_SELECTION_TTS_SILENCE", 0.0)))
-TTS_FIRST_CHUNK = max(0, min(300, env_int("SPEAK_SELECTION_TTS_FIRST_CHUNK", 120)))
+TTS_FIRST_CHUNK = max(0, min(300, env_int("SPEAK_SELECTION_TTS_FIRST_CHUNK", 100)))
 INITIAL_BUFFER_SEGMENTS = max(1, min(4, env_int("SPEAK_SELECTION_INITIAL_BUFFER", 1)))
+STREAM_SEGMENT_TRAILING_BREAK = env_bool("SPEAK_SELECTION_STREAM_SEGMENT_TRAILING_BREAK", True)
 
 # Environment options:
 # - SPEAK_SELECTION_VOICE: auto | M1..M5 | F1..F5 | /path/to/voice.json
@@ -184,13 +221,23 @@ INITIAL_BUFFER_SEGMENTS = max(1, min(4, env_int("SPEAK_SELECTION_INITIAL_BUFFER"
 # - SPEAK_SELECTION_TTS_SILENCE: silence between Supertonic chunks (seconds)
 # - SPEAK_SELECTION_TTS_FIRST_CHUNK: first chunk size for faster start (0 disables)
 # - SPEAK_SELECTION_INITIAL_BUFFER: number of chunks to buffer before playback
+# - SPEAK_SELECTION_STREAM_SEGMENT_TRAILING_BREAK: add a small break after streamed text chunks
 # - SPEAK_SELECTION_AUTO_LANGUAGE: 1|true|yes to route text to matching language voices
+# - SPEAK_SELECTION_LANGUAGE: auto or ISO language code (example: en)
 # - SPEAK_SELECTION_CACHE_ENABLED: 1|true|yes to cache synthesized audio
 # - SPEAK_SELECTION_CACHE_MAX_FILES: max number of cached wav files
 # - SPEAK_SELECTION_ARTICLE_MAX_CHARS: max article text length when using --read-page
+# - SPEAK_SELECTION_CPU_THREADS: Supertonic CPU worker limit (default 2)
+# - SPEAK_SELECTION_INTER_OP_THREADS: Supertonic graph worker limit (default 1)
+# - SPEAK_SELECTION_PROCESS_NICE: Unix background priority adjustment (default 5)
+# - SPEAK_SELECTION_CACHE_PRUNE_INTERVAL: minimum seconds between cache scans
 
 DEFAULT_TEST_TEXT = "This is a hardcoded test of the speak selection script."
 SEGMENT_MAX_CHARS = 220
+
+
+class SynthesisCancelled(Exception):
+    """Raised before inference when a newer speech request supersedes this one."""
 
 
 def ensure_state_dir():
@@ -220,6 +267,48 @@ def apply_post_gain_to_wav(path: str):
         return
 
     if params.sampwidth != 2 or not audio_data:
+        return
+
+    # NumPy is already a Supertonic dependency. Its vectorized operations avoid
+    # several slow Python passes over every sample between streamed segments.
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+
+    if np is not None:
+        samples_np = np.frombuffer(audio_data, dtype="<i2").astype(np.int32)
+        if samples_np.size == 0:
+            return
+
+        if WAV_COMPRESS_ENABLED and WAV_COMPRESS_RATIO > 1.0:
+            threshold = int(32767 * clamp_float(WAV_COMPRESS_THRESHOLD, 0.05, 0.99))
+            amplitudes = np.abs(samples_np)
+            over_threshold = amplitudes > threshold
+            if np.any(over_threshold):
+                compressed = threshold + (
+                    (amplitudes[over_threshold] - threshold) / WAV_COMPRESS_RATIO
+                ).astype(np.int32)
+                samples_np[over_threshold] = np.sign(samples_np[over_threshold]) * np.minimum(
+                    compressed, 32767
+                )
+
+        max_sample = int(np.max(np.abs(samples_np)))
+        if max_sample <= 0:
+            return
+
+        peak_limit = int(32767 * target_peak)
+        gain = min(target_gain, peak_limit / max_sample)
+        if gain > 1.001:
+            samples_np = np.clip(samples_np * gain, -32768, 32767).astype(np.int32)
+
+        boosted = samples_np.astype("<i2").tobytes()
+        try:
+            with wave.open(path, "wb") as wav_out:
+                wav_out.setparams(params)
+                wav_out.writeframes(boosted)
+        except Exception:
+            return
         return
 
     samples = array("h")
@@ -422,7 +511,7 @@ def compute_request_hash(text: str, voice_preference: str = "", audio_settings: 
         audio_settings = current_audio_settings()
 
     fingerprint_obj = {
-        "text": normalize_text(text),
+        "text": sanitize_tts_text(text),
         "voice": (voice_preference or "").strip(),
         "audio": audio_settings,
         "lang": (lang or "").strip(),
@@ -689,20 +778,289 @@ def normalize_text(text: str) -> str:
     return " ".join(text.replace("\r", "\n").split())
 
 
+def normalize_text_preserving_breaks(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    collapsed = "\n".join(lines)
+    collapsed = re.sub(r"\n{3,}", "\n\n", collapsed)
+    return collapsed.strip()
+
+
+SPOKEN_SYMBOLS = {
+    "α": "alpha",
+    "Α": "alpha",
+    "β": "beta",
+    "Β": "beta",
+    "γ": "gamma",
+    "Γ": "gamma",
+    "δ": "delta",
+    "Δ": "delta",
+    "∆": "delta",
+    "ε": "epsilon",
+    "Ε": "epsilon",
+    "ζ": "zeta",
+    "Ζ": "zeta",
+    "η": "eta",
+    "Η": "eta",
+    "θ": "theta",
+    "Θ": "theta",
+    "ι": "iota",
+    "Ι": "iota",
+    "κ": "kappa",
+    "Κ": "kappa",
+    "λ": "lambda",
+    "Λ": "lambda",
+    "μ": "mu",
+    "Μ": "mu",
+    "ν": "nu",
+    "Ν": "nu",
+    "ξ": "xi",
+    "Ξ": "xi",
+    "ο": "omicron",
+    "Ο": "omicron",
+    "π": "pi",
+    "Π": "pi",
+    "ρ": "rho",
+    "Ρ": "rho",
+    "σ": "sigma",
+    "ς": "sigma",
+    "Σ": "sigma",
+    "τ": "tau",
+    "Τ": "tau",
+    "υ": "upsilon",
+    "Υ": "upsilon",
+    "φ": "phi",
+    "ϕ": "phi",
+    "Φ": "phi",
+    "χ": "chi",
+    "Χ": "chi",
+    "ψ": "psi",
+    "Ψ": "psi",
+    "ω": "omega",
+    "Ω": "omega",
+    "∇": "nabla",
+    "∂": "partial",
+    "∝": "proportional to",
+    "∞": "infinity",
+    "∑": "sum",
+    "∏": "product",
+    "∫": "integral",
+    "∬": "double integral",
+    "∭": "triple integral",
+    "∮": "contour integral",
+    "√": "square root",
+    "∛": "cube root",
+    "∜": "fourth root",
+    "≈": "approximately equal to",
+    "≃": "approximately equal to",
+    "≅": "approximately equal to",
+    "≠": "not equal to",
+    "≤": "less than or equal to",
+    "≥": "greater than or equal to",
+    "<": "less than",
+    ">": "greater than",
+    "±": "plus or minus",
+    "∓": "minus or plus",
+    "×": "times",
+    "·": "times",
+    "⋅": "times",
+    "÷": "divided by",
+    "−": "minus",
+    "∈": "in",
+    "∉": "not in",
+    "∋": "contains",
+    "∌": "does not contain",
+    "⊂": "subset of",
+    "⊃": "superset of",
+    "⊆": "subset of or equal to",
+    "⊇": "superset of or equal to",
+    "∪": "union",
+    "∩": "intersection",
+    "∅": "empty set",
+    "∀": "for all",
+    "∃": "there exists",
+    "∄": "there does not exist",
+    "∧": "and",
+    "∨": "or",
+    "¬": "not",
+    "⊕": "xor",
+    "⇒": "implies",
+    "⇔": "if and only if",
+    "→": "to",
+    "←": "from",
+    "↔": "if and only if",
+    "↦": "maps to",
+    "∴": "therefore",
+    "∵": "because",
+    "∠": "angle",
+    "⊥": "perpendicular to",
+    "∥": "parallel to",
+    "°": "degrees",
+    "′": "prime",
+    "″": "double prime",
+}
+
+
+def expand_spoken_symbols(text: str) -> str:
+    if not text:
+        return ""
+
+    translated = []
+    for char in text:
+        spoken = SPOKEN_SYMBOLS.get(char)
+        if spoken:
+            translated.append(f" {spoken} ")
+        else:
+            translated.append(char)
+
+    return "".join(translated)
+
+
+def sanitize_tts_text(text: str, preserve_breaks: bool = False) -> str:
+    text = normalize_text_preserving_breaks(text)
+    if not text:
+        return ""
+
+    cleaned = []
+    for char in text:
+        if char in {"\n", "\t"}:
+            cleaned.append(char)
+            continue
+        if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Co", "Cn"}:
+            continue
+        cleaned.append(char)
+
+    cleaned_text = "".join(cleaned)
+
+    # Preserve multiple blank lines as explicit paragraph boundaries
+    # Convert 2+ consecutive newlines to a sentinel (two newlines -> '\n\n')
+    cleaned_text = re.sub(r"\n{2,}", "\n\n", cleaned_text)
+
+    # Normalize common dash/ellipsis variants to spoken forms that avoid
+    # confusing short isolated punctuation tokens in TTS.
+    cleaned_text = re.sub(r"\ben\s*[-–]\s*dash\b", "en dash", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r"\bem\s*[-—]\s*dash\b", "em dash", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = cleaned_text.replace("–", ", ")
+    cleaned_text = cleaned_text.replace("—", ", ")
+    cleaned_text = cleaned_text.replace("…", " ellipsis ")
+
+    # Normalize common list markers to ensure they act like sentence starts
+    cleaned_text = re.sub(r"(?m)^[ \t]*([0-9]+)\.[ \t]+", r"\nItem \1: ", cleaned_text)
+    cleaned_text = re.sub(r"(?m)^[ \t]*[-*+]\s+", "\nBullet: ", cleaned_text)
+
+    # Replace URLs before math/punctuation expansion so query strings do not
+    # leak into speech as isolated symbols.
+    cleaned_text = re.sub(r"\bURL:\s*", "URL: ", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r"https?://(?:www\.)?([^/\s?#]+)(?:[^\s]*)", r"link \1", cleaned_text)
+
+    cleaned_text = expand_spoken_symbols(cleaned_text)
+
+    # Math and number-friendly normalizations to improve TTS/ASR roundtrips.
+    # Apply currency before decimal expansion so "$5.00" stays a money phrase.
+    def _money_replace(match):
+        amount = match.group(1)
+        try:
+            value = float(amount)
+        except ValueError:
+            return f"{amount} dollars"
+        if value.is_integer():
+            return f"{int(value)} dollars"
+        dollars = int(value)
+        cents = int(round((value - dollars) * 100))
+        if dollars and cents:
+            return f"{dollars} dollars and {cents} cents"
+        if dollars:
+            return f"{dollars} dollars"
+        return f"{cents} cents"
+
+    cleaned_text = re.sub(r"\$([0-9]+(?:\.[0-9]+)?)", _money_replace, cleaned_text)
+    # exponents: 2^10 -> '2 to the 10'
+    cleaned_text = re.sub(r"(\d+)\^(\d+)", r"\1 to the \2", cleaned_text)
+    # fractions: 1/2 -> '1 over 2'
+    cleaned_text = re.sub(r"(\d+)/(\d+)", r"\1 over \2", cleaned_text)
+    # decimals: 3.14 -> '3 point 14'
+    cleaned_text = re.sub(r"(\d+)\.(\d+)", r"\1 point \2", cleaned_text)
+    # equals signs in formulas are usually clearer when spoken.
+    cleaned_text = re.sub(r"\s*=\s*", " equals ", cleaned_text)
+    cleaned_text = re.sub(r"\s*\+\s*", " plus ", cleaned_text)
+    # percent
+    cleaned_text = re.sub(r"([0-9]+)\%", r"\1 percent", cleaned_text)
+
+    # Compress long punctuation runs into a spoken token to reduce ASR garbling
+    cleaned_text = re.sub(r"[!?.]{2,}", " punctuation ", cleaned_text)
+    cleaned_text = re.sub(r"\bellipsis\s+ellipsis\b", "ellipsis", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r"[()\[\]]+", " ", cleaned_text)
+    cleaned_text = re.sub(r"[-]{2,}", " ", cleaned_text)
+    cleaned_text = re.sub(r"[,;:]{2,}", " ", cleaned_text)
+    cleaned_text = cleaned_text.replace('"', " ")
+    cleaned_text = cleaned_text.replace("'", " ")
+    cleaned_text = cleaned_text.replace("“", " ")
+    cleaned_text = cleaned_text.replace("”", " ")
+    cleaned_text = cleaned_text.replace("‘", " ")
+    cleaned_text = cleaned_text.replace("’", " ")
+    cleaned_text = re.sub(r"\s+([,;:.!?])", r"\1", cleaned_text)
+
+    # Convert long digit sequences to words when possible to improve ASR
+    try:
+        from num2words import num2words as _num2words
+    except Exception:
+        _num2words = None
+
+    def _num_replace(m):
+        s = m.group(0)
+        if _num2words:
+            try:
+                return _num2words(int(s))
+            except Exception:
+                return s
+        return s
+
+    cleaned_text = re.sub(r"\b\d{3,}\b", lambda m: _num_replace(m), cleaned_text)
+
+    # Trim any leading non-word punctuation (but keep leading newlines)
+    cleaned_text = re.sub(r"^[^\w\n]+", "", cleaned_text)
+
+    if preserve_breaks:
+        return normalize_text_preserving_breaks(cleaned_text)
+    return normalize_text(cleaned_text)
+
+
+def prepare_segment_for_synthesis(text: str) -> str:
+    text = sanitize_tts_text(text)
+    if not text or not STREAM_SEGMENT_TRAILING_BREAK:
+        return text
+    if re.search(r"[.!?,;:]$", text):
+        return text
+    return f"{text}."
+
+
 def chunk_text_for_streaming(text: str) -> list[str]:
-    text = normalize_text(text)
+    text = sanitize_tts_text(text, preserve_breaks=True)
     if not text:
         return []
 
     segments = []
-    sentence_parts = re.split(r"(?<=[.!?])\s+", text)
+    effective_max = SEGMENT_MAX_CHARS
+    # Treat paragraph breaks and list markers as strong sentence boundaries
+    # Split on sentence enders, but also on blank-line paragraph breaks and list starts
+    sentence_parts = []
+    for para in re.split(r"\n\n+", text):
+        para = para.strip()
+        if not para:
+            continue
+        # Split preserving list starts as their own lines
+        # Use scoped inline flags so the pattern is compatible across Python versions
+        parts = re.split(r"(?<=[.!?])\s+|(?m:(?=^-\s))|(?m:(?=^[0-9]+\.))", para)
+        for p in parts:
+            if p and p.strip() and re.search(r"\w", p):
+                sentence_parts.append(p.strip())
 
     for part in sentence_parts:
         part = part.strip()
-        if not part:
+        if not part or not re.search(r"\w", part):
             continue
 
-        if len(part) <= SEGMENT_MAX_CHARS:
+        if len(part) <= effective_max:
             segments.append(part)
             continue
 
@@ -715,13 +1073,12 @@ def chunk_text_for_streaming(text: str) -> list[str]:
                 continue
 
             candidate = f"{current} {clause}".strip() if current else clause
-            if current and len(candidate) > SEGMENT_MAX_CHARS:
+            if current and len(candidate) > effective_max:
                 segments.append(current)
-                current = clause
-                continue
+                current = ""
 
-            if len(clause) <= SEGMENT_MAX_CHARS:
-                current = candidate
+            if len(clause) <= effective_max:
+                current = f"{current} {clause}".strip() if current else clause
                 continue
 
             if current:
@@ -732,7 +1089,7 @@ def chunk_text_for_streaming(text: str) -> list[str]:
             word_chunk = ""
             for word in words:
                 candidate = f"{word_chunk} {word}".strip() if word_chunk else word
-                if word_chunk and len(candidate) > SEGMENT_MAX_CHARS:
+                if word_chunk and len(candidate) > effective_max:
                     segments.append(word_chunk)
                     word_chunk = word
                 else:
@@ -748,22 +1105,38 @@ def chunk_text_for_streaming(text: str) -> list[str]:
 
 
 def split_text_for_low_latency(text: str) -> list[str]:
-    text = normalize_text(text)
+    text = sanitize_tts_text(text)
     if not text:
         return []
 
     if TTS_FIRST_CHUNK <= 0 or len(text) <= TTS_FIRST_CHUNK:
         return chunk_text_for_streaming(text)
 
-    cutoff = text.rfind(" ", 0, TTS_FIRST_CHUNK + 1)
+    first_chunk_target = TTS_FIRST_CHUNK
+    cutoff = text.rfind(" ", 0, first_chunk_target + 1)
     if cutoff < 20:
-        cutoff = TTS_FIRST_CHUNK
+        cutoff = first_chunk_target
 
     first = text[:cutoff].strip()
     rest = text[cutoff:].strip()
+
+    rest_segments = chunk_text_for_streaming(rest) if rest else []
+    if (
+        TTS_FIRST_CHUNK < 140
+        and len(first) < 140
+        and rest_segments
+        and len(rest_segments[0]) >= 180
+    ):
+        first_chunk_target = 140
+        cutoff = text.rfind(" ", 0, first_chunk_target + 1)
+        if cutoff < 20:
+            cutoff = first_chunk_target
+        first = text[:cutoff].strip()
+        rest = text[cutoff:].strip()
+        rest_segments = chunk_text_for_streaming(rest) if rest else []
+
     segments = [first] if first else []
-    if rest:
-        segments.extend(chunk_text_for_streaming(rest))
+    segments.extend(rest_segments)
     return segments
 
 
@@ -963,6 +1336,76 @@ def start_daemon():
     )
 
 
+def _letter_script(char: str) -> str:
+    name = unicodedata.name(char, "")
+    if "LATIN" in name:
+        return "latin"
+    if "GREEK" in name:
+        return "greek"
+    if "CYRILLIC" in name:
+        return "cyrillic"
+    if "ARABIC" in name:
+        return "arabic"
+    if any(token in name for token in ("CJK", "HIRAGANA", "KATAKANA")):
+        return "cjk"
+    if char.isalpha():
+        return "other"
+    return ""
+
+
+def _script_counts(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for char in text:
+        script = _letter_script(char)
+        if script:
+            counts[script] = counts.get(script, 0) + 1
+    return counts
+
+
+def _looks_like_english_selection(text: str) -> bool:
+    words = set(re.findall(r"[A-Za-z]+", text.lower()))
+    if not words:
+        return False
+
+    english_markers = {
+        "a",
+        "after",
+        "and",
+        "are",
+        "be",
+        "by",
+        "case",
+        "colon",
+        "dash",
+        "edge",
+        "ellipsis",
+        "end",
+        "first",
+        "helper",
+        "here",
+        "is",
+        "item",
+        "link",
+        "list",
+        "load",
+        "metric",
+        "more",
+        "of",
+        "punctuation",
+        "results",
+        "selection",
+        "sentence",
+        "should",
+        "text",
+        "the",
+        "this",
+        "to",
+        "url",
+        "with",
+    }
+    return bool(words & english_markers)
+
+
 def detect_text_language(text: str) -> str:
     if not AUTO_LANGUAGE_ROUTING:
         return ""
@@ -971,10 +1414,29 @@ def detect_text_language(text: str) -> str:
     if len(text) < 12:
         return ""
 
+    script_counts = _script_counts(text)
+    total_letters = sum(script_counts.values())
+    latin_letters = script_counts.get("latin", 0)
+    non_latin_scripts = {
+        script: count
+        for script, count in script_counts.items()
+        if script != "latin" and count > 0
+    }
+
+    if total_letters:
+        non_latin_total = total_letters - latin_letters
+        if len(non_latin_scripts) >= 2:
+            dominant_non_latin = max(non_latin_scripts.values())
+            if dominant_non_latin / total_letters < 0.65:
+                return "na"
+
+        if latin_letters / total_letters > 0.85 and _looks_like_english_selection(text):
+            return "en"
+
     try:
         from langdetect import detect
     except Exception:
-        return ""
+        return "en" if _looks_like_english_selection(text) else ""
 
     try:
         detected = detect(text)
@@ -982,12 +1444,21 @@ def detect_text_language(text: str) -> str:
         return ""
 
     if not detected:
-        return ""
+        return "en" if _looks_like_english_selection(text) else ""
 
-    return detected.split("-")[0].lower()
+    detected = detected.split("-")[0].lower()
+    if detected != "en" and _looks_like_english_selection(text):
+        if not total_letters or latin_letters / max(total_letters, 1) > 0.7:
+            return "en"
+
+    return detected
 
 
 def resolve_language(text: str) -> str:
+    preference = get_language_preference()
+    if preference and preference != "auto":
+        return preference
+
     language_code = detect_text_language(text)
     if language_code:
         return language_code
@@ -1019,6 +1490,21 @@ def sanitize_voice_preference(preference: str) -> str:
     return pref
 
 
+def sanitize_language_preference(preference: str) -> str:
+    pref = (preference or "").strip().lower()
+    if not pref or pref == "auto" or pref == "na":
+        return "auto"
+
+    allowed = {code for code, _label in LANGUAGE_OPTIONS if code != "auto"}
+    if pref in allowed:
+        return pref
+
+    if re.match(r"^[a-z]{2,3}$", pref):
+        return pref
+
+    return "auto"
+
+
 def get_voice_preference() -> str:
     env_voice = os.environ.get("SPEAK_SELECTION_VOICE")
     if env_voice is not None:
@@ -1032,6 +1518,21 @@ def get_voice_preference() -> str:
         return sanitized
 
     return "auto"
+
+
+def get_language_preference() -> str:
+    env_lang = os.environ.get("SPEAK_SELECTION_LANGUAGE")
+    if env_lang is not None:
+        return sanitize_language_preference(env_lang)
+
+    setting_lang = USER_SETTINGS.get("language_preference")
+    if isinstance(setting_lang, str) and setting_lang.strip():
+        sanitized = sanitize_language_preference(setting_lang)
+        if sanitized == "auto" and setting_lang.strip().lower() not in {"auto", "na"}:
+            update_user_settings({"language_preference": "auto"})
+        return sanitized
+
+    return DEFAULT_LANGUAGE_PREFERENCE
 
 
 def list_voice_style_paths() -> list[Path]:
@@ -1114,7 +1615,7 @@ def is_cache_audio_path(path: str) -> bool:
 
 
 def make_speak_payload(text: str, voice_preference: str = "") -> dict:
-    normalized = normalize_text(text)
+    normalized = sanitize_tts_text(text)
     lang = resolve_language(normalized) if normalized else ""
     settings = current_audio_settings()
     return {
@@ -1215,7 +1716,7 @@ def fetch_article_text(url: str) -> str:
 
     decoded = payload.decode("utf-8", errors="ignore")
     extracted = html_to_readable_text(decoded)
-    extracted = normalize_text(extracted)
+    extracted = sanitize_tts_text(extracted)
     if not extracted:
         raise RuntimeError("Could not extract readable text from page.")
     return extracted
@@ -1496,8 +1997,10 @@ def settings_ui_main():
     speed_value_var = tk.StringVar(value=f"{speed_var.get():.2f}x")
 
     voice_choice_var = tk.StringVar()
+    language_choice_var = tk.StringVar()
     voice_label_to_option = {}
     voice_options = {"items": []}
+    language_label_to_code = {}
     apply_lock = threading.Lock()
     audio_apply_after_id = {"id": None}
 
@@ -1571,11 +2074,21 @@ def settings_ui_main():
     )
     voice_combo.grid(row=6, column=1, sticky="ew", pady=(12, 0))
 
+    ttk.Label(frame, text="Language", style="Field.TLabel").grid(row=7, column=0, sticky="w", pady=(10, 0))
+    language_combo = ttk.Combobox(
+        frame,
+        state="readonly",
+        width=30,
+        textvariable=language_choice_var,
+        style="Modern.TCombobox",
+    )
+    language_combo.grid(row=7, column=1, sticky="ew", pady=(10, 0))
+
     ttk.Label(
         frame,
         text="Custom voices appear from ~/.cache/supertonic3 or SPEAK_SELECTION_VOICE_DIR.",
         style="Muted.TLabel",
-    ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     samples_link = ttk.Label(
         frame,
@@ -1583,10 +2096,10 @@ def settings_ui_main():
         style="Link.TLabel",
         cursor="hand2",
     )
-    samples_link.grid(row=8, column=1, sticky="w", pady=(6, 0))
+    samples_link.grid(row=9, column=1, sticky="w", pady=(6, 0))
 
     ttk.Label(frame, textvariable=status_var, style="Status.TLabel", wraplength=340).grid(
-        row=9,
+        row=10,
         column=0,
         columnspan=2,
         sticky="w",
@@ -1594,7 +2107,7 @@ def settings_ui_main():
     )
 
     button_row = ttk.Frame(frame, style="Action.TFrame")
-    button_row.grid(row=10, column=0, columnspan=2, sticky="e", pady=(12, 0))
+    button_row.grid(row=11, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
     revert_button = ttk.Button(button_row, text="Revert Defaults", width=14)
     revert_button.grid(row=0, column=0, padx=(0, 8))
@@ -1709,6 +2222,24 @@ def settings_ui_main():
     def refresh_voice_list():
         populate_voice_choices(_voice_option_items())
 
+    def populate_language_choices():
+        language_label_to_code.clear()
+        labels = []
+        for code, label in LANGUAGE_OPTIONS:
+            language_label_to_code[label] = code
+            labels.append(label)
+
+        language_combo["values"] = labels
+        current = get_language_preference()
+        selected_label = None
+        for code, label in LANGUAGE_OPTIONS:
+            if code == current:
+                selected_label = label
+                break
+        if selected_label is None:
+            selected_label = "Auto detect"
+        language_choice_var.set(selected_label)
+
     def apply_audio_only_async():
         audio_settings = ui_audio_settings()
 
@@ -1768,6 +2299,29 @@ def settings_ui_main():
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def apply_language_selection_async():
+        selected_label = language_choice_var.get()
+        code = language_label_to_code.get(selected_label, "auto")
+        status_var.set("Saving...")
+
+        def _worker():
+            try:
+                sanitized = sanitize_language_preference(code)
+                update_user_settings({"language_preference": sanitized})
+                send_control_command("set_language", language=sanitized)
+
+                def _done():
+                    status_var.set("Saved.")
+
+                root.after(0, _done)
+            except Exception as e:
+                def _error(err=e):
+                    status_var.set(f"Could not save settings: {err}")
+
+                root.after(0, _error)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def on_volume_changed():
         volume_value_var.set(f"{int(round(volume_var.get()))}%")
         schedule_audio_apply()
@@ -1786,6 +2340,7 @@ def settings_ui_main():
 
     voice_combo.configure(postcommand=restyle_voice_dropdown_items)
     voice_combo.bind("<<ComboboxSelected>>", lambda _event: apply_voice_selection_async())
+    language_combo.bind("<<ComboboxSelected>>", lambda _event: apply_language_selection_async())
     samples_link.bind("<Button-1>", open_voice_samples)
     samples_link.bind("<Enter>", lambda _event: samples_link.configure(foreground="#1e40af"))
     samples_link.bind("<Leave>", lambda _event: samples_link.configure(foreground="#1d4ed8"))
@@ -1793,6 +2348,7 @@ def settings_ui_main():
     refresh_button.configure(command=refresh_voice_list)
 
     populate_voice_choices(_voice_option_items())
+    populate_language_choices()
     root.bind("<Escape>", lambda _event: root.destroy())
 
     try:
@@ -1852,8 +2408,33 @@ def tray_main():
     def action_open_settings(icon, item):
         run_background(open_settings_ui)
 
+    def set_language_preference(preference: str):
+        sanitized = sanitize_language_preference(preference)
+        update_user_settings({"language_preference": sanitized})
+        send_control_command("set_language", language=sanitized)
+
+    def current_language_preference() -> str:
+        return get_language_preference()
+
+    def action_set_language(icon, item, code: str):
+        set_language_preference(code)
+
+    def is_language_selected(item, code: str) -> bool:
+        return current_language_preference() == code
+
     def action_quit(icon, item):
         icon.stop()
+
+    language_menu_items = []
+    for code, label in LANGUAGE_OPTIONS:
+        language_menu_items.append(
+            pystray.MenuItem(
+                label,
+                functools.partial(action_set_language, code=code),
+                checked=functools.partial(is_language_selected, code=code),
+                radio=True,
+            )
+        )
 
     menu = pystray.Menu(
         pystray.MenuItem("Open Settings", action_open_settings, default=True),
@@ -1861,6 +2442,7 @@ def tray_main():
         pystray.MenuItem("Pause / Resume", action_pause),
         pystray.MenuItem("Stop", action_stop),
         pystray.MenuItem("Read Page From URL In Clipboard", action_read_page),
+        pystray.MenuItem("Language", pystray.Menu(*language_menu_items)),
         pystray.MenuItem("Quit", action_quit),
     )
 
@@ -1913,6 +2495,7 @@ def speak_text_direct(text: str, voice_preference: str = ""):
         "--force-window=no",
         "--audio-display=no",
         "--audio-pitch-correction=yes",
+        "--gapless-audio=yes",
         f"--volume-max={MPV_VOLUME_MAX}",
         f"--volume={PLAYBACK_VOLUME}",
         f"--speed={PLAYBACK_SPEED}",
@@ -1944,6 +2527,7 @@ class Daemon:
         self.voice_cache = {}
         self.server = None
         self.mpv_proc = None
+        self.ipc_request_id = 0
         self.current_hash = ""
         self.pending_hash = ""
         self.current_temp = None
@@ -1951,12 +2535,36 @@ class Daemon:
         self.old_temps = []
         self.request_serial = 0
         self.state_lock = threading.Lock()
+        # ONNX inference cannot be interrupted mid-call. Serializing it prevents
+        # a cancelled request and its replacement from saturating the machine
+        # concurrently (and avoids sharing the same TTS sessions across threads).
+        self.synthesis_lock = threading.Lock()
         self.voice_preference_override = ""
+        self.language_preference_override = ""
         self.tts = None
+        self.process_priority_applied = False
+        self.last_cache_prune = 0.0
 
     def get_tts(self):
         if self.tts is not None:
             return self.tts
+
+        # Supertonic creates ONNX Runtime sessions lazily. Set conservative
+        # native-library defaults before importing it so synthesis leaves CPU
+        # capacity for the desktop and audio player.
+        thread_count = str(TTS_CPU_THREADS)
+        os.environ["SUPERTONIC_INTRA_OP_THREADS"] = thread_count
+        os.environ["SUPERTONIC_INTER_OP_THREADS"] = str(TTS_INTER_OP_THREADS)
+        os.environ.setdefault("OMP_NUM_THREADS", thread_count)
+        os.environ.setdefault("MKL_NUM_THREADS", thread_count)
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", thread_count)
+
+        if not self.process_priority_applied and TTS_PROCESS_NICE and os.name == "posix":
+            try:
+                os.nice(TTS_PROCESS_NICE)
+            except OSError:
+                pass
+            self.process_priority_applied = True
 
         try:
             from supertonic import TTS
@@ -1967,7 +2575,16 @@ class Daemon:
                 "python3 -m pip install supertonic soundfile"
             ) from e
 
-        self.tts = TTS(auto_download=True)
+        try:
+            self.tts = TTS(
+                auto_download=True,
+                intra_op_num_threads=TTS_CPU_THREADS,
+                inter_op_num_threads=TTS_INTER_OP_THREADS,
+            )
+        except TypeError:
+            # Older Supertonic releases read the environment variables above
+            # but do not yet accept explicit thread-count arguments.
+            self.tts = TTS(auto_download=True)
         return self.tts
 
     def resolve_voice_style(self, preference: Optional[str] = None):
@@ -2026,6 +2643,7 @@ class Daemon:
             "--force-window=no",
             "--audio-display=no",
             "--audio-pitch-correction=yes",
+            "--gapless-audio=yes",
             f"--volume-max={MPV_VOLUME_MAX}",
             f"--volume={PLAYBACK_VOLUME}",
         ]
@@ -2056,25 +2674,43 @@ class Daemon:
     def mpv_json(self, payload: dict) -> dict:
         self.ensure_mpv()
 
+        request_id = self.ipc_request_id + 1
+        self.ipc_request_id = request_id
+
+        message = dict(payload)
+        message["request_id"] = request_id
+
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(1.0)
             s.connect(str(MPV_SOCKET_PATH))
-            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            s.sendall((json.dumps(message) + "\n").encode("utf-8"))
 
-            data = b""
-            while b"\n" not in data:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+            buffer = ""
+            while True:
+                if "\n" not in buffer:
+                    try:
+                        chunk = s.recv(4096)
+                    except Exception:
+                        return {}
 
-        if not data:
-            return {}
+                    if not chunk:
+                        return {}
 
-        try:
-            return json.loads(data.decode("utf-8", errors="ignore").strip())
-        except Exception:
-            return {}
+                    buffer += chunk.decode("utf-8", errors="ignore")
+                    continue
+
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    response = json.loads(line)
+                except Exception:
+                    continue
+
+                if response.get("request_id") == request_id:
+                    return response
 
     def mpv_command(self, *args):
         return self.mpv_json({"command": list(args)})
@@ -2098,23 +2734,92 @@ class Daemon:
         voice_style,
         lang: str,
         segment_text: bool = False,
+        should_cancel=None,
+    ):
+        with self.synthesis_lock:
+            if should_cancel is not None and should_cancel():
+                raise SynthesisCancelled()
+            return self._synthesize_text_to_file(
+                text,
+                output_path,
+                voice_style,
+                lang,
+                segment_text=segment_text,
+            )
+
+    def _synthesize_text_to_file(
+        self,
+        text: str,
+        output_path: str,
+        voice_style,
+        lang: str,
+        segment_text: bool = False,
     ):
         tts = self.get_tts()
-        units = chunk_text_for_streaming(text) if segment_text else [normalize_text(text)]
+        units = chunk_text_for_streaming(text) if segment_text else [sanitize_tts_text(text)]
         if not units:
             raise RuntimeError("No text to synthesize.")
 
         if len(units) == 1:
-            wav, _ = tts.synthesize(
-                text=units[0],
-                voice_style=voice_style,
-                total_steps=TTS_STEPS,
-                speed=TTS_SPEED,
-                max_chunk_length=TTS_MAX_CHUNK,
-                silence_duration=TTS_SILENCE_DURATION,
-                lang=lang,
-                verbose=False,
-            )
+            try:
+                wav, _ = tts.synthesize(
+                    text=units[0],
+                    voice_style=voice_style,
+                    total_steps=TTS_STEPS,
+                    speed=TTS_SPEED,
+                    max_chunk_length=TTS_MAX_CHUNK,
+                    silence_duration=TTS_SILENCE_DURATION,
+                    lang=lang,
+                    verbose=False,
+                )
+            except ValueError as exc:
+                msg = str(exc)
+                if "Invalid language" in msg:
+                    lang = "na"
+                    wav, _ = tts.synthesize(
+                        text=units[0],
+                        voice_style=voice_style,
+                        total_steps=TTS_STEPS,
+                        speed=TTS_SPEED,
+                        max_chunk_length=TTS_MAX_CHUNK,
+                        silence_duration=TTS_SILENCE_DURATION,
+                        lang=lang,
+                        verbose=False,
+                    )
+                elif "unsupported character" in msg or "unsupported characters" in msg:
+                    # Attempt to strip unsupported characters reported by the TTS
+                    try:
+                        # message may contain a representation of the unsupported chars
+                        unsupported = []
+                        m = re.search(r"unsupported character\(s\): \[(.*)\]", msg)
+                        if m:
+                            raw = m.group(1)
+                            # crude split by comma and strip quotes/spaces
+                            for part in raw.split(","):
+                                ch = part.strip().strip("'\" ")
+                                if ch:
+                                    unsupported.append(ch)
+                        # Fallback: remove characters in the 'So' (symbol) category that are non-ascii
+                        if not unsupported:
+                            unsupported = [c for c in units[0] if ord(c) > 127 and unicodedata.category(c).startswith("S")]
+
+                        cleaned = "".join(ch for ch in units[0] if ch not in unsupported)
+                        if not cleaned:
+                            raise
+                        wav, _ = tts.synthesize(
+                            text=cleaned,
+                            voice_style=voice_style,
+                            total_steps=TTS_STEPS,
+                            speed=TTS_SPEED,
+                            max_chunk_length=TTS_MAX_CHUNK,
+                            silence_duration=TTS_SILENCE_DURATION,
+                            lang=lang,
+                            verbose=False,
+                        )
+                    except Exception:
+                        raise
+                else:
+                    raise
             write_wav_16bit(output_path, wav)
             return
 
@@ -2125,16 +2830,61 @@ class Daemon:
             with wave.open(tmp_path, "wb") as wav_out:
                 first_chunk = True
                 for unit in units:
-                    wav, _ = tts.synthesize(
-                        text=unit,
-                        voice_style=voice_style,
-                        total_steps=TTS_STEPS,
-                        speed=TTS_SPEED,
-                        max_chunk_length=TTS_MAX_CHUNK,
-                        silence_duration=TTS_SILENCE_DURATION,
-                        lang=lang,
-                        verbose=False,
-                    )
+                    try:
+                        wav, _ = tts.synthesize(
+                            text=unit,
+                            voice_style=voice_style,
+                            total_steps=TTS_STEPS,
+                            speed=TTS_SPEED,
+                            max_chunk_length=TTS_MAX_CHUNK,
+                            silence_duration=TTS_SILENCE_DURATION,
+                            lang=lang,
+                            verbose=False,
+                        )
+                    except ValueError as exc:
+                            msg = str(exc)
+                            if "Invalid language" in msg:
+                                fallback_lang = "na"
+                                wav, _ = tts.synthesize(
+                                    text=unit,
+                                    voice_style=voice_style,
+                                    total_steps=TTS_STEPS,
+                                    speed=TTS_SPEED,
+                                    max_chunk_length=TTS_MAX_CHUNK,
+                                    silence_duration=TTS_SILENCE_DURATION,
+                                    lang=fallback_lang,
+                                    verbose=False,
+                                )
+                            elif "unsupported character" in msg or "unsupported characters" in msg:
+                                try:
+                                    unsupported = []
+                                    m = re.search(r"unsupported character\(s\): \[(.*)\]", msg)
+                                    if m:
+                                        raw = m.group(1)
+                                        for part in raw.split(","):
+                                            ch = part.strip().strip("'\" ")
+                                            if ch:
+                                                unsupported.append(ch)
+                                    if not unsupported:
+                                        unsupported = [c for c in unit if ord(c) > 127 and unicodedata.category(c).startswith("S")]
+
+                                    cleaned = "".join(ch for ch in unit if ch not in unsupported)
+                                    if not cleaned:
+                                        raise
+                                    wav, _ = tts.synthesize(
+                                        text=cleaned,
+                                        voice_style=voice_style,
+                                        total_steps=TTS_STEPS,
+                                        speed=TTS_SPEED,
+                                        max_chunk_length=TTS_MAX_CHUNK,
+                                        silence_duration=TTS_SILENCE_DURATION,
+                                        lang=lang,
+                                        verbose=False,
+                                    )
+                                except Exception:
+                                    raise
+                            else:
+                                raise
                     segment_path = tempfile.mktemp(prefix="speak-selection-seg-", suffix=".wav", dir=str(STATE_DIR))
                     write_wav_16bit(segment_path, wav)
 
@@ -2164,6 +2914,11 @@ class Daemon:
         if not CACHE_ENABLED:
             return
 
+        now = time.monotonic()
+        if now - self.last_cache_prune < CACHE_PRUNE_INTERVAL:
+            return
+        self.last_cache_prune = now
+
         ensure_cache_dir()
         try:
             cache_files = sorted(
@@ -2182,10 +2937,22 @@ class Daemon:
             except Exception:
                 pass
 
-    def synthesize_segment_to_temp(self, text: str, voice_style, voice_label: str, lang: str) -> str:
+    def synthesize_segment_to_temp(
+        self,
+        text: str,
+        voice_style,
+        voice_label: str,
+        lang: str,
+        should_cancel=None,
+    ) -> str:
+        synthesis_text = prepare_segment_for_synthesis(text)
+
+        if should_cancel is not None and should_cancel():
+            raise SynthesisCancelled()
+
         if CACHE_ENABLED:
             ensure_cache_dir()
-            cache_path = synthesis_cache_path(text, voice_label, lang)
+            cache_path = synthesis_cache_path(synthesis_text, voice_label, lang)
             if cache_path.exists():
                 try:
                     os.utime(cache_path, None)
@@ -2201,7 +2968,14 @@ class Daemon:
             os.close(fd)
 
             try:
-                self.synthesize_text_to_file(text, tmp_path, voice_style, lang=lang, segment_text=False)
+                self.synthesize_text_to_file(
+                    synthesis_text,
+                    tmp_path,
+                    voice_style,
+                    lang=lang,
+                    segment_text=False,
+                    should_cancel=should_cancel,
+                )
                 apply_post_gain_to_wav(tmp_path)
                 os.replace(tmp_path, cache_path)
                 self.prune_cache_files()
@@ -2222,7 +2996,7 @@ class Daemon:
         os.close(fd)
 
         try:
-            self.synthesize_text_to_file(text, path, voice_style, lang=lang, segment_text=False)
+            self.synthesize_text_to_file(synthesis_text, path, voice_style, lang=lang, segment_text=False)
             apply_post_gain_to_wav(path)
             return path
         except Exception:
@@ -2367,12 +3141,21 @@ class Daemon:
                 if not self.is_request_current(request_id):
                     break
 
-                path = self.synthesize_segment_to_temp(
-                    segment,
-                    voice_style=voice_style,
-                    voice_label=voice_label,
-                    lang=lang,
-                )
+                try:
+                    path = self.synthesize_segment_to_temp(
+                        segment,
+                        voice_style=voice_style,
+                        voice_label=voice_label,
+                        lang=lang,
+                        should_cancel=lambda: not self.is_request_current(request_id),
+                    )
+                except SynthesisCancelled:
+                    break
+                except Exception:
+                    # Skip this segment on any synthesis error and continue with
+                    # the remaining text; do not let one failing chunk stop
+                    # the whole worker thread.
+                    continue
 
                 if not self.is_request_current(request_id):
                     if not is_cache_audio_path(path):
@@ -2409,7 +3192,14 @@ class Daemon:
                     queued_paths = []
                     playback_started = True
                 elif playback_started:
-                    self.mpv_command("loadfile", path, "append")
+                    if self.is_idle():
+                        self.mpv_command("loadfile", path, "replace")
+                        self.mpv_command("set_property", "pause", False)
+                        self.mpv_command("set_property", "speed", PLAYBACK_SPEED)
+                        self.mpv_command("set_property", "volume-max", MPV_VOLUME_MAX)
+                        self.mpv_command("set_property", "volume", PLAYBACK_VOLUME)
+                    else:
+                        self.mpv_command("loadfile", path, "append")
 
             if not playback_started and queued_paths and self.is_request_current(request_id):
                 self.mpv_command("loadfile", queued_paths[0], "replace")
@@ -2424,6 +3214,9 @@ class Daemon:
 
     def handle_speak(self, text: str, text_hash: str, voice_preference: str = "", lang: str = "na"):
         self.ensure_mpv()
+
+        if getattr(self, "language_preference_override", ""):
+            lang = self.language_preference_override
 
         if not text:
             if EMPTY_SELECTION_TOGGLES:
@@ -2448,6 +3241,13 @@ class Daemon:
             self.voice_preference_override = ""
         else:
             self.voice_preference_override = preference
+
+    def handle_set_language(self, language_preference: str):
+        preference = sanitize_language_preference(language_preference)
+        if preference == "auto":
+            self.language_preference_override = ""
+        else:
+            self.language_preference_override = preference
 
     def handle_set_audio_settings(self, settings: dict):
         apply_audio_settings(settings)
@@ -2554,6 +3354,8 @@ class Daemon:
                         self.handle_stop()
                     elif cmd == "set_voice":
                         self.handle_set_voice(payload.get("voice", ""))
+                    elif cmd == "set_language":
+                        self.handle_set_language(payload.get("language", ""))
                     elif cmd == "set_audio_settings":
                         self.handle_set_audio_settings(payload.get("audio_settings", {}))
                 except Exception:
